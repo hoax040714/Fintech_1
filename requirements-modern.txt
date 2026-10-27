@@ -1,0 +1,4 @@
+-r requirements-neural.txt
+pytabkit==1.7.3
+tabpfn==9.2.0
+huggingface-hub==0.36.0

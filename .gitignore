@@ -1,0 +1,41 @@
+# 本地Python环境和编辑器配置
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.idea/
+.vscode/
+.pytest_cache/
+
+# 原始数据、因子、下载缓存与备份不上传；只保留数据说明
+/data/*
+!/data/README.md
+!/data/合并大表数据目录.md
+/models/
+/results/
+*.csv
+*.parquet
+*.xlsx
+*.xls
+*.sqlite
+*.sqlite3
+*.db
+*.joblib
+*.pkl
+*.pt
+*.pth
+*.npz
+
+# 这份导出网页嵌入了行情和结果，不作为源码上传
+/股票收益预测项目_展示样板.html
+
+# 密钥和运行日志；保留.streamlit/config.toml网页主题
+.env
+.env.*
+.streamlit/secrets.toml
+*.pem
+*.key
+*.log
+*.part
+Thumbs.db
+.DS_Store
