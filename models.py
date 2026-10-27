@@ -5,37 +5,23 @@ import json
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.cross_decomposition import PLSRegression
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.base import clone
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
-from sklearn.inspection import permutation_importance
-from sklearn.linear_model import ElasticNet, Lasso, Ridge
+from sklearn.linear_model import Lasso, Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from data import MODEL_DIR, RESULT_DIR, prepare_folders
+from price_source import MODEL_DIR, RESULT_DIR, PRICE_FILE, prepare_folders, source_signature
 from factors import FEATURES, HORIZONS
+from factor_selection import (
+    PREPROCESSING_VERSION, FactorScreen, selection_configs, make_preprocessor,
+    preprocessing_summary, pca_loadings, choose_validation_trial,
+)
 
 
 RANDOM_STATE = 42
-MODEL_LABELS = {
-    "lasso": "Lasso",
-    "ridge": "Ridge",
-    "random_forest": "Random Forest",
-    "ols": "OLS（弱Ridge）",
-    "ols3": "OLS3（双因子）",
-    "pls": "PLS",
-    "enet": "ElasticNet",
-    "gbrt": "GBRT",
-    "lgbm": "LightGBM",
-    "xgb": "XGBoost",
-    "lstm": "LSTM",
-    "transformer": "Transformer",
-    "realmlp": "RealMLP",
-    "tabpfn": "TabPFN（128条抽样）",
-}
-DEFAULT_MODELS = list(MODEL_LABELS)[:10]
 
 
 def linear_pipeline(model) -> Pipeline:
@@ -48,9 +34,9 @@ def linear_pipeline(model) -> Pipeline:
     )
 
 
-def build_models(model_names=None, device="cpu") -> dict[str, list[tuple[str, object]]]:
-    """在这里增加模型或候选参数。"""
-    candidates = {
+def build_models() -> dict[str, list[tuple[str, object]]]:
+    """基础估计器参数候选；正式train_models会先接入筛选/降维预处理。"""
+    return {
         "lasso": [
             (f"alpha={alpha:g}", linear_pipeline(Lasso(alpha=alpha, max_iter=10000)))
             for alpha in (0.0001, 0.0005, 0.001)
@@ -64,7 +50,7 @@ def build_models(model_names=None, device="cpu") -> dict[str, list[tuple[str, ob
                 "trees=150,min_leaf=20",
                 Pipeline(
                     [
-                        ("imputer", SimpleImputer(strategy="median")),
+                        ("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
                         (
                             "model",
                             RandomForestRegressor(
@@ -81,56 +67,6 @@ def build_models(model_names=None, device="cpu") -> dict[str, list[tuple[str, ob
             )
         ],
     }
-    # 重复的 Lasso / Random Forest 保留当前项目参数，其余沿用参考目录。
-    for name in model_names or DEFAULT_MODELS:
-        if name in candidates or name in {"lstm", "transformer"}:
-            continue
-        if name in {"ols", "ols3"}:
-            candidates[name] = [("alpha=0.0001", linear_pipeline(Ridge(alpha=1e-4)))]
-        elif name == "pls":
-            candidates[name] = [("n_components=2", linear_pipeline(PLSRegression(n_components=2)))]
-        elif name == "enet":
-            candidates[name] = [("alpha=0.001,l1_ratio=0.5", linear_pipeline(
-                ElasticNet(alpha=0.001, l1_ratio=0.5, max_iter=3000)
-            ))]
-        else:
-            if name == "gbrt":
-                estimator = GradientBoostingRegressor(
-                    n_estimators=80, learning_rate=0.05, max_depth=2, random_state=RANDOM_STATE
-                )
-            elif name == "lgbm":
-                from lightgbm import LGBMRegressor
-                estimator = LGBMRegressor(
-                    n_estimators=100, learning_rate=0.05, max_depth=4, num_leaves=15,
-                    n_jobs=1, verbosity=-1, random_state=RANDOM_STATE,
-                )
-            elif name == "xgb":
-                from xgboost import XGBRegressor
-                estimator = XGBRegressor(
-                    n_estimators=100, learning_rate=0.05, max_depth=3, n_jobs=1,
-                    objective="reg:squarederror", tree_method="hist", random_state=RANDOM_STATE,
-                )
-            elif name == "realmlp":
-                from pytabkit import RealMLP_TD_Regressor
-                estimator = RealMLP_TD_Regressor(
-                    n_threads=1, device=device, random_state=RANDOM_STATE,
-                    n_epochs=30, batch_size=128, verbosity=0,
-                )
-            elif name == "tabpfn":
-                import torch
-                from tabpfn import TabPFNRegressor
-                torch.set_num_threads(1)
-                estimator = TabPFNRegressor(
-                    n_estimators=4, device=device, random_state=RANDOM_STATE,
-                    n_preprocessing_jobs=1, ignore_pretraining_limits=True,
-                    model_path="auto",
-                )
-            candidates[name] = [("参考目录固定参数", Pipeline([
-                ("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
-                ("model", estimator),
-            ]))]
-    return {name: candidates[name] for name in (model_names or DEFAULT_MODELS)
-            if name not in {"lstm", "transformer"}}
 
 
 def chronological_split(
@@ -141,6 +77,9 @@ def chronological_split(
     cut1 = int(len(dates) * 0.70)
     cut2 = int(len(dates) * 0.85)
 
+    if cut1 <= horizon or cut2 - cut1 <= horizon or cut2 >= len(dates):
+        raise ValueError(f"{horizon}日预测的交易日期不足，无法同时保留训练/验证/测试及标签隔离带")
+
     train_dates = set(dates[: cut1 - horizon])
     validation_dates = set(dates[cut1 : cut2 - horizon])
     test_dates = set(dates[cut2:])
@@ -148,6 +87,12 @@ def chronological_split(
     train = data[data["date"].isin(train_dates)].copy()
     validation = data[data["date"].isin(validation_dates)].copy()
     test = data[data["date"].isin(test_dates)].copy()
+    # 停牌等情形下，N条个股观察可能跨越更多A股日期；再用真实标签终点检查边界。
+    if "_label_end_date" in data:
+        train = train[train["_label_end_date"] < dates[cut1]].copy()
+        validation = validation[validation["_label_end_date"] < dates[cut2]].copy()
+    if train.empty or validation.empty or test.empty:
+        raise ValueError("标签隔离后存在空分区，不能训练或选择因子")
     return train, validation, test
 
 
@@ -161,228 +106,122 @@ def regression_metrics(y_true: pd.Series, y_pred: np.ndarray) -> dict[str, float
     }
 
 
-def feature_importance(model: Pipeline, X, y, model_name="") -> tuple[np.ndarray, str]:
+def feature_importance(model: Pipeline) -> np.ndarray:
     estimator = model.named_steps["model"]
     if hasattr(estimator, "coef_"):
-        return np.asarray(estimator.coef_, dtype=float).ravel(), "系数"
-    if hasattr(estimator, "feature_importances_"):
-        return np.asarray(estimator.feature_importances_, dtype=float), "模型内置重要性"
-    limit = 32 if model_name == "tabpfn" else 128
-    sample = X.sample(n=min(limit, len(X)), random_state=RANDOM_STATE)
-    result = permutation_importance(
-        model, sample, y.loc[sample.index], scoring="neg_mean_absolute_error",
-        n_repeats=1, random_state=RANDOM_STATE,
-    )
-    return result.importances_mean, "置换重要性（MAE增量）"
+        values = np.asarray(estimator.coef_, dtype=float)
+    else:
+        values = np.asarray(estimator.feature_importances_, dtype=float)
+    if "preprocess" not in model.named_steps:
+        return values
+    prep = model.named_steps["preprocess"]
+    names = prep.named_steps["select"].columns
+    reducer = prep.named_steps["pca"]
+    if reducer != "passthrough":
+        # 线性系数可以回投影；树模型这里只是平方载荷分摊代理，不能解释成原始重要性。
+        matrix = reducer.components_.T
+        values = matrix @ values if hasattr(estimator, "coef_") else (matrix ** 2) @ values
+    output = pd.Series(0., index=FEATURES)
+    output.loc[names] = values
+    return output.to_numpy()
 
 
-def fit_rows(frame, model_name):
-    """TabPFN 只从本次允许训练的数据中抽样128行。"""
-    if model_name == "tabpfn" and len(frame) > 128:
-        return frame.sample(n=128, random_state=RANDOM_STATE).sort_values(["date", "code"])
-    return frame
+def importance_method(model):
+    linear = hasattr(model.named_steps["model"], "coef_")
+    prep = model.named_steps.get("preprocess")
+    pca = prep is not None and prep.named_steps["pca"] != "passthrough"
+    return ("pca_backprojected_standardized_coefficient" if pca else "standardized_coefficient") if linear else (
+        "pca_squared_loading_proxy" if pca else "impurity_importance")
 
 
-def predict_model(model, X, model_name):
-    """TabPFN 每次预测32行，其余模型直接预测。"""
-    if model_name == "tabpfn":
-        return np.concatenate([
-            np.asarray(model.predict(X.iloc[start:start + 32])).ravel()
-            for start in range(0, len(X), 32)
-        ])
-    return np.asarray(model.predict(X)).ravel()
+def horizon_samples(features, horizon):
+    """标签数值不变，补充真实终点用于防止个股停牌造成标签跨分区。"""
+    target = f"future_return_{horizon}d"
+    ordered = features[["date", "code"]].sort_values(["code", "date"])
+    ends = ordered.groupby("code", sort=False)["date"].shift(-horizon)
+    usable = features.dropna(subset=[target]).copy()
+    usable["_label_end_date"] = ends.reindex(usable.index)
+    return usable.dropna(subset=["_label_end_date"])
 
 
-def build_sequence_model(model_name, input_size, window=20):
-    """沿用参考目录的小型 LSTM / 单层 Transformer。"""
-    from torch import nn
-    import torch
-
-    class SequenceModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.projection = nn.Linear(input_size, 32)
-            if model_name == "lstm":
-                self.encoder = nn.LSTM(32, 16, batch_first=True)
-                self.head = nn.Linear(16, 1)
-            else:
-                layer = nn.TransformerEncoderLayer(
-                    d_model=32, nhead=4, dim_feedforward=64, dropout=0.1, batch_first=True
-                )
-                self.encoder = nn.TransformerEncoder(layer, num_layers=1)
-                self.position = nn.Parameter(torch.zeros(1, window, 32))
-                self.head = nn.Linear(32, 1)
-
-        def forward(self, x):
-            x = self.projection(x)
-            if model_name == "transformer":
-                x = self.encoder(x + self.position)
-            else:
-                x, _ = self.encoder(x)
-            return self.head(x[:, -1, :]).squeeze(-1)
-
-    return SequenceModel()
+def tune_models(train, validation, target, screen, counts=(20, 40, 60, 80),
+                pca_variances=(.90, .95), relative_tolerance=0.):
+    """预处理每个候选只拟合一次，然后供所有模型参数复用；测试集不是本函数参数。"""
+    families = build_models()
+    all_trials = []
+    for config in selection_configs(screen, counts, pca_variances):
+        prep = make_preprocessor(screen, config)
+        x_train = prep.fit_transform(train[FEATURES])
+        x_valid = prep.transform(validation[FEATURES])
+        details = preprocessing_summary(prep, screen, config)
+        print(f"  验证 {config.name}：{details['selected_factor_count']}因子 → {details['model_input_dimensions']}维", flush=True)
+        for model_name, candidates in families.items():
+            for label, pipeline in candidates:
+                estimator = clone(pipeline.named_steps["model"])
+                estimator.fit(x_train, train[target])
+                prediction = estimator.predict(x_valid)
+                all_trials.append({"model": model_name, "params": label,
+                                   "trial_id": f"{model_name}|{config.name}|{label}",
+                                   "validation_mae": float(mean_absolute_error(validation[target], prediction)),
+                                   "validation_rmse": float(np.sqrt(mean_squared_error(validation[target], prediction))),
+                                   "validation_direction_accuracy": float(np.mean(np.sign(prediction) == np.sign(validation[target]))),
+                                   **details, "config": config, "estimator": clone(estimator)})
+        del x_train, x_valid
+    winners = {name: choose_validation_trial([row for row in all_trials if row["model"] == name], relative_tolerance)
+               for name in families}
+    return winners, all_trials
 
 
-def sequence_data(frame, columns, median, std, window=20):
-    """记录每只股票的窗口终点；只在取批次时展开20日窗口，避免占满内存。"""
-    frame = frame.sort_values(["code", "date"]).reset_index(drop=True)
-    values = ((frame[columns].fillna(median) - median) / std).clip(-10, 10)
-    values = values.to_numpy(np.float32)
-    ends = []
-    for _, stock in frame.groupby("code", sort=False):
-        ends.extend(range(stock.index[0] + window - 1, stock.index[-1] + 1))
-    ends = np.asarray(ends, dtype=int)
-    return values, ends, frame.iloc[ends].copy()
+def fit_selected_model(data, target, screen, config, estimator):
+    prep = make_preprocessor(screen, config)
+    values = prep.fit_transform(data[FEATURES])
+    fitted = clone(estimator).fit(values, data[target])
+    # 已拟合的筛选边界、填充、缩放、PCA和回归器一起保存，预测时只做transform。
+    return Pipeline([("preprocess", prep), ("model", fitted)])
 
 
-def predict_sequence(model, values, ends, state, device="cpu", batch_size=128):
-    """按批次预测，每个窗口只取同一只股票的历史记录。"""
-    import torch
-    model.eval()
-    predictions = []
-    with torch.no_grad():
-        for start in range(0, len(ends), batch_size):
-            positions = ends[start:start + batch_size, None] - np.arange(state["window"] - 1, -1, -1)
-            x = torch.from_numpy(values[positions]).to(device)
-            predictions.append(model(x).cpu().numpy())
-    if not predictions:
-        return np.empty(0)
-    return np.concatenate(predictions) * state["target_scale"] + state["target_center"]
-
-
-def fit_sequence(model_name, train, validation, columns, target, epochs=8, device="cpu"):
-    """训练期预处理，验证期选择轮数；传入空验证表时按固定轮数重新拟合。"""
-    import torch
-    torch.set_num_threads(1)
-    torch.manual_seed(RANDOM_STATE)
-    median = train[columns].median().fillna(0)
-    std = train[columns].std().replace(0, 1).fillna(1)
-    values, ends, rows = sequence_data(train, columns, median, std)
-    target_values = rows[target].to_numpy(np.float32)
-    state = {
-        "model": model_name, "features": columns, "median": median, "std": std,
-        "window": 20, "target_center": float(target_values.mean()),
-        "target_scale": float(target_values.std()) or 1.0,
-        "fit_rows": len(ends),
-    }
-    target_values = (target_values - state["target_center"]) / state["target_scale"]
-    model = build_sequence_model(model_name, len(columns)).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    loss_fn = torch.nn.MSELoss()
-    if not validation.empty:
-        valid_values, valid_ends, valid_rows = sequence_data(validation, columns, median, std)
-    best_mae = np.inf
-    best_state = None
-    best_epoch = epochs
-
-    for epoch in range(epochs):
-        model.train()
-        for start in range(0, len(ends), 128):
-            positions = ends[start:start + 128, None] - np.arange(19, -1, -1)
-            x = torch.from_numpy(values[positions]).to(device)
-            y = torch.from_numpy(target_values[start:start + 128]).to(device)
-            optimizer.zero_grad(set_to_none=True)
-            loss_fn(model(x), y).backward()
-            optimizer.step()
-        if not validation.empty:
-            pred = predict_sequence(model, valid_values, valid_ends, state, device)
-            mae = mean_absolute_error(valid_rows[target], pred)
-            if mae < best_mae:
-                best_mae = mae
-                best_epoch = epoch + 1
-                best_state = {key: value.detach().clone() for key, value in model.state_dict().items()}
-
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    state["epochs"] = best_epoch
-    return model, state
-
-
-def predict_saved_sequence(saved, frame, device="cpu"):
-    """读取 joblib 字典后恢复网络，返回具备20日窗口的记录和预测。"""
-    model = build_sequence_model(saved["model"], len(saved["features"]), saved["window"]).to(device)
-    model.load_state_dict(saved["state_dict"])
-    values, ends, rows = sequence_data(
-        frame, saved["features"], saved["median"], saved["std"], saved["window"]
-    )
-    return rows, predict_sequence(model, values, ends, saved, device)
-
-
-def train_models(features: pd.DataFrame, model_names=None, horizons=None,
-                 nn_epochs=8, device="cpu") -> tuple[pd.DataFrame, pd.DataFrame]:
-    """验证集选参数，测试集评估，全部成熟样本训练最终模型。"""
+def train_models(features: pd.DataFrame, relative_tolerance: float = 0.) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """训练期筛选，验证期选择数量/PCA/参数，测试期只评估，成熟全样本另拟合生产模型。"""
     prepare_folders()
+    if not 0 <= relative_tolerance <= .1:
+        raise ValueError("验证MAE相对容忍度必须位于0至0.1")
     metric_rows = []
     importance_rows = []
     prediction_rows = []
     latest_rows = []
-    model_features = {}
+    trial_rows, selection_rows, preprocessing_rows, loading_rows = [], [], [], []
+    production_inputs = {}
 
     latest_date = features["date"].max()
     latest = features[features["date"] == latest_date].dropna(subset=FEATURES, how="all").copy()
-    model_names = model_names or DEFAULT_MODELS
-    horizons = horizons or HORIZONS
 
-    for horizon in horizons:
+    for horizon in HORIZONS:
         target = f"future_return_{horizon}d"
-        usable = features.dropna(subset=[target]).copy()
+        usable = horizon_samples(features, horizon)
         train, validation, test = chronological_split(usable, horizon)
-        columns = [column for column in FEATURES if train[column].notna().any()]
-        # 因子筛选只看训练期；OLS3取前2个，4个可选模型取前30个。
-        ranked = train[columns].corrwith(train[target]).abs().dropna().sort_values(ascending=False)
-        candidates_by_name = build_models(model_names, device)
+        print(f"筛选与验证 / {horizon}日 ...", flush=True)
+        screen = FactorScreen().fit(train[FEATURES], train[target], train["date"])
+        winners, trials = tune_models(train, validation, target, screen, relative_tolerance=relative_tolerance)
+        for row in trials:
+            trial_rows.append({"horizon": horizon, **{k: v for k, v in row.items() if k not in ("config", "estimator")},
+                               "chosen": winners[row["model"]]["trial_id"] == row["trial_id"]})
+        train_validation = pd.concat([train, validation], ignore_index=True)
+        evaluation_screen = FactorScreen().fit(train_validation[FEATURES], train_validation[target], train_validation["date"])
 
-        for model_name in model_names:
-            print(f"训练 {model_name} / {horizon} 日 ...", flush=True)
-
-            model_columns = columns
-            if model_name == "ols3":
-                model_columns = ranked.head(2).index.tolist()
-            elif model_name in {"lstm", "transformer", "realmlp", "tabpfn"}:
-                model_columns = ranked.head(30).index.tolist()
-            model_features[f"{model_name}_{horizon}d"] = model_columns
-            train_validation = pd.concat([train, validation], ignore_index=True)
-            test_rows = test
-            if model_name in {"lstm", "transformer"}:
-                _, selected_state = fit_sequence(
-                    model_name, train, validation, model_columns, target, nn_epochs, device
-                )
-                best_model, state = fit_sequence(
-                    model_name, train_validation, pd.DataFrame(), model_columns,
-                    target, selected_state["epochs"], device,
-                )
-                test_values, test_ends, test_rows = sequence_data(
-                    test, model_columns, state["median"], state["std"]
-                )
-                test_pred = predict_sequence(best_model, test_values, test_ends, state, device)
-                best_label = f"window=20,epochs={selected_state['epochs']}"
-                # 输入层权重仅描述网络连接强度，不与树的重要性或回归系数比较。
-                values = best_model.projection.weight.detach().abs().mean(dim=0).cpu().numpy()
-                importance_type = "输入层平均绝对权重（非预测重要性）"
-            else:
-                best_label = ""
-                best_model = None
-                best_mae = np.inf
-                fitted_train = fit_rows(train, model_name)
-                for label, candidate in candidates_by_name[model_name]:
-                    candidate.fit(fitted_train[model_columns], fitted_train[target])
-                    validation_pred = predict_model(candidate, validation[model_columns], model_name)
-                    validation_mae = mean_absolute_error(validation[target], validation_pred)
-                    if validation_mae < best_mae:
-                        best_label, best_model, best_mae = label, candidate, validation_mae
-                fitted = fit_rows(train_validation, model_name)
-                best_model.fit(fitted[model_columns], fitted[target])
-                test_pred = predict_model(best_model, test[model_columns], model_name)
-                values, importance_type = feature_importance(
-                    best_model, test[model_columns], test[target], model_name
-                )
+        for model_name, winner in winners.items():
+            config = winner["config"]
+            print(f"训练 {model_name} / {horizon} 日：{config.name} / {winner['params']}", flush=True)
+            best_model = fit_selected_model(train_validation, target, evaluation_screen, config, winner["estimator"])
+            test_pred = best_model.predict(test[FEATURES])
 
             metric_rows.append(
                 {
                     "model": model_name,
                     "horizon": horizon,
-                    "best_params": best_label,
+                    "best_params": winner["params"],
+                    "validation_mae": winner["validation_mae"],
+                    "mae_tolerance": relative_tolerance,
+                    **preprocessing_summary(best_model.named_steps["preprocess"], evaluation_screen, config),
                     "train_start": train["date"].min(),
                     "train_end": train["date"].max(),
                     "validation_start": validation["date"].min(),
@@ -391,52 +230,64 @@ def train_models(features: pd.DataFrame, model_names=None, horizons=None,
                     "test_end": test["date"].max(),
                     "n_train": len(train),
                     "n_validation": len(validation),
-                    "n_test": len(test_rows),
-                    "n_features": len(model_columns),
-                    "fit_rows": state["fit_rows"] if model_name in {"lstm", "transformer"} else len(fitted),
-                    **regression_metrics(test_rows[target], test_pred),
+                    "n_test": len(test),
+                    **regression_metrics(test[target], test_pred),
                 }
             )
 
-            predictions = test_rows[["date", "code", "name", target]].copy()
+            predictions = test[["date", "code", "name", target]].copy()
             predictions = predictions.rename(columns={target: "actual_return"})
             predictions["predicted_return"] = test_pred
             predictions["model"] = model_name
             predictions["horizon"] = horizon
             prediction_rows.append(predictions)
 
-            for factor, value in zip(model_columns, values):
+            for factor, value in zip(FEATURES, feature_importance(best_model)):
                 importance_rows.append(
                     {
                         "model": model_name,
                         "horizon": horizon,
                         "factor": factor,
                         "importance": float(value),
-                        "importance_type": importance_type,
+                        "importance_method": importance_method(best_model),
+                        "stage": "test_evaluation",
                     }
                 )
 
-            if model_name in {"lstm", "transformer"}:
-                best_model, state = fit_sequence(
-                    model_name, usable, pd.DataFrame(), model_columns,
-                    target, selected_state["epochs"], device,
-                )
-                state["state_dict"] = {key: value.detach().cpu() for key, value in best_model.state_dict().items()}
-                joblib.dump(state, MODEL_DIR / f"{model_name}_{horizon}d.joblib")
-                history = features.sort_values("date").groupby("code", sort=False).tail(20)
-                latest_values, latest_ends, latest_rows_frame = sequence_data(
-                    history, model_columns, state["median"], state["std"]
-                )
-                latest_pred = predict_sequence(best_model, latest_values, latest_ends, state, device)
-                latest_prediction = latest_rows_frame[["date", "code", "name", "close"]].copy()
-                latest_prediction["predicted_return"] = latest_pred
-                latest_prediction = latest_prediction[latest_prediction["date"] == latest_date].copy()
-            else:
-                final_train = fit_rows(usable, model_name)
-                best_model.fit(final_train[model_columns], final_train[target])
-                joblib.dump(best_model, MODEL_DIR / f"{model_name}_{horizon}d.joblib")
-                latest_prediction = latest[["date", "code", "name", "close"]].copy()
-                latest_prediction["predicted_return"] = predict_model(best_model, latest[model_columns], model_name)
+            for stage, fitted_screen, fitted_model in (
+                ("search_train", screen, None), ("test_evaluation", evaluation_screen, best_model),
+            ):
+                audit = fitted_screen.report(config)
+                audit["model"], audit["horizon"], audit["stage"] = model_name, horizon, stage
+                selection_rows.append(audit)
+                if fitted_model is not None:
+                    prep = fitted_model.named_steps["preprocess"]
+                    preprocessing_rows.append({"model": model_name, "horizon": horizon, "stage": stage,
+                                               **preprocessing_summary(prep, fitted_screen, config)})
+                    loadings = pca_loadings(prep)
+                    loadings["model"], loadings["horizon"], loadings["stage"] = model_name, horizon, stage
+                    loading_rows.append(loadings)
+
+        # 本周期所有测试评估结束后，才允许使用全部成熟标签拟合最新预测模型。
+        production_screen = FactorScreen().fit(usable[FEATURES], usable[target], usable["date"])
+        for model_name, winner in winners.items():
+            config = winner["config"]
+            production_model = fit_selected_model(usable, target, production_screen, config, winner["estimator"])
+            joblib.dump(production_model, MODEL_DIR / f"{model_name}_{horizon}d.joblib")
+            prep = production_model.named_steps["preprocess"]
+            summary = preprocessing_summary(prep, production_screen, config)
+            production_inputs[f"{model_name}_{horizon}d"] = {
+                "selected_factors": production_screen.selected_features(config), **summary,
+            }
+            audit = production_screen.report(config)
+            audit["model"], audit["horizon"], audit["stage"] = model_name, horizon, "production"
+            selection_rows.append(audit)
+            preprocessing_rows.append({"model": model_name, "horizon": horizon, "stage": "production", **summary})
+            loadings = pca_loadings(prep)
+            loadings["model"], loadings["horizon"], loadings["stage"] = model_name, horizon, "production"
+            loading_rows.append(loadings)
+            latest_prediction = latest[["date", "code", "name", "close"]].copy()
+            latest_prediction["predicted_return"] = production_model.predict(latest[FEATURES])
             latest_prediction["reference_target_price"] = (
                 latest_prediction["close"] * (1 + latest_prediction["predicted_return"])
             )
@@ -455,18 +306,54 @@ def train_models(features: pd.DataFrame, model_names=None, horizons=None,
     pd.concat(latest_rows, ignore_index=True).to_csv(
         RESULT_DIR / "latest_predictions.csv", index=False, encoding="utf-8-sig"
     )
+    pd.DataFrame(trial_rows).to_csv(RESULT_DIR / "model_selection_trials.csv", index=False, encoding="utf-8-sig")
+    pd.concat(selection_rows, ignore_index=True).to_csv(RESULT_DIR / "factor_selection.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame(preprocessing_rows).to_csv(RESULT_DIR / "preprocessing_summary.csv", index=False, encoding="utf-8-sig")
+    pd.concat(loading_rows, ignore_index=True).to_csv(RESULT_DIR / "pca_loadings.csv", index=False, encoding="utf-8-sig")
 
     metadata = {
+        "data_source": PRICE_FILE.name,
+        "preprocessing_version": PREPROCESSING_VERSION,
+        "model_inputs": production_inputs,
+        "source_sha256": source_signature(),
         "generated_at": pd.Timestamp.now().isoformat(timespec="seconds"),
         "latest_market_date": str(pd.Timestamp(latest_date).date()),
         "features": FEATURES,
-        "horizons": list(horizons),
-        "models": model_names,
-        "model_features": model_features,
-        "tabpfn_train_limit": 128 if "tabpfn" in model_names else None,
+        "horizons": list(HORIZONS),
         "stock_count": int(features["code"].nunique()),
     }
     (RESULT_DIR / "metadata.json").write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(metadata, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
     )
     return metrics, predictions
+
+
+def audit_factor_selection(features: pd.DataFrame):
+    """只检查各预测周期的训练期筛选和候选维数；不选择验证赢家，不生成预测。"""
+    folder = RESULT_DIR / "selection_audit"
+    folder.mkdir(parents=True, exist_ok=True)
+    audits, summaries = [], []
+    for horizon in HORIZONS:
+        target = f"future_return_{horizon}d"
+        train, _, _ = chronological_split(horizon_samples(features, horizon), horizon)
+        screen = FactorScreen().fit(train[FEATURES], train[target], train["date"])
+        # 诊断PCA只用训练期的按日期均衡样本，完整训练时会重新在完整训练分区拟合。
+        sampled = train.iloc[screen.sample_positions_]
+        print(f"筛选审计 / {horizon}日：417 → 质量{len(screen.ranked_features_)} → 去冗余{len(screen.independent_features_)}", flush=True)
+        for config in selection_configs(screen):
+            prep = make_preprocessor(screen, config).fit(sampled[FEATURES])
+            summary = preprocessing_summary(prep, screen, config)
+            summaries.append({"horizon": horizon, "stage": "training_sample_diagnostic",
+                              "pca_fit_rows": len(sampled), **summary})
+            audit = screen.report(config)
+            audit["horizon"] = horizon
+            audits.append(audit)
+    pd.concat(audits, ignore_index=True).to_csv(folder / "factor_screening.csv", index=False, encoding="utf-8-sig")
+    result = pd.DataFrame(summaries)
+    result.to_csv(folder / "dimension_candidates.csv", index=False, encoding="utf-8-sig")
+    manifest = {"preprocessing_version": PREPROCESSING_VERSION, "data_source": PRICE_FILE.name,
+                "source_sha256": source_signature(), "feature_rows": len(features),
+                "stock_count": int(features["code"].nunique()), "horizons": list(HORIZONS),
+                "stage": "training_sample_diagnostic", "validation_winner_selected": False}
+    (folder / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return result

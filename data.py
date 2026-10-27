@@ -1,21 +1,22 @@
-"""行情、财报、宏观、日历与全球指数；直接运行只补充数据，不训练模型。
-
-新增依赖：python -m pip install exchange-calendars
-全球数据通过 Yahoo 的免费日线接口获取，交易所日历用于处理夏令时和休市。
-"""
+"""在线下载并合并行情、财报、宏观、日历和全球指数，生成根目录 prices.parquet。"""
 
 from pathlib import Path
+import os
+import stat
+import tempfile
 import time
 
 import akshare as ak
 import numpy as np
 import pandas as pd
 import requests
+from price_source import PRICE_FILE, validate_prices, load_prices as read_parquet_prices
 
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
-PRICE_DIR = DATA_DIR / "prices"
+CACHE_DIR = DATA_DIR / "download_cache"
+PRICE_DIR = CACHE_DIR / "prices"
 MODEL_DIR = BASE_DIR / "models"
 RESULT_DIR = BASE_DIR / "results"
 START_DATE = "20200101"
@@ -59,7 +60,7 @@ FINANCIAL_FIELDS = {
 
 def prepare_folders() -> None:
     """创建项目运行需要的目录。"""
-    for folder in (DATA_DIR, PRICE_DIR, MODEL_DIR, RESULT_DIR):
+    for folder in (DATA_DIR, CACHE_DIR, PRICE_DIR, MODEL_DIR, RESULT_DIR):
         folder.mkdir(parents=True, exist_ok=True)
 
 
@@ -76,7 +77,7 @@ def get_end_date(end_date: str | None = None) -> str:
 def get_stock_pool(n_stocks: int = 300, refresh: bool = False) -> pd.DataFrame:
     """每次获取沪深300最新成分股，默认保留全部300只。"""
     prepare_folders()
-    cache = DATA_DIR / "stock_pool.csv"
+    cache = CACHE_DIR / "stock_pool.csv"
 
     raw = ak.index_stock_cons_csindex(symbol="000300")
     pool = raw.rename(columns={
@@ -148,13 +149,12 @@ def download_prices(
 
     prices = pd.concat(frames, ignore_index=True)
     prices = prices.drop_duplicates(["date", "code"]).sort_values(["date", "code"])
-    prices.to_csv(DATA_DIR / "prices.csv", index=False, encoding="utf-8-sig")
     return prices
 
 
 def get_stock_industry(pool: pd.DataFrame, refresh: bool = False) -> pd.DataFrame:
     """查询每只股票当前所属的申万一级行业。"""
-    cache = DATA_DIR / "stock_industry.csv"
+    cache = CACHE_DIR / "stock_industry.csv"
     pool = pool.copy()
     pool["code"] = pool["code"].astype(str).str.zfill(6)
 
@@ -234,7 +234,7 @@ def download_industry_prices(
     refresh: bool = False,
 ) -> pd.DataFrame:
     """下载股票池所涉及行业的日频行情。"""
-    cache = DATA_DIR / "industry_prices.csv"
+    cache = CACHE_DIR / "industry_prices.csv"
     end_date = get_end_date(end_date)
     start = pd.to_datetime(start_date)
     end = pd.to_datetime(end_date)
@@ -276,7 +276,7 @@ def download_market_prices(
     refresh: bool = False,
 ) -> pd.DataFrame:
     """下载沪深300日频行情并计算大盘当日收益率。"""
-    cache = DATA_DIR / "market_prices.csv"
+    cache = CACHE_DIR / "market_prices.csv"
     end_date = get_end_date(end_date)
     start = pd.to_datetime(start_date)
     end = pd.to_datetime(end_date)
@@ -390,18 +390,20 @@ def add_market_context(
 
 
 def load_prices() -> pd.DataFrame:
-    return pd.read_csv(DATA_DIR / "prices.csv", parse_dates=["date"], dtype={"code": str})
+    """兼容入口；最终合并数据统一读Parquet，不再读旧行情CSV。"""
+    return read_parquet_prices()
 
 
 def fresh_cache(path: Path, end_date: str, refresh: bool) -> bool:
     """同一天已下载的文件直接复用；失败的下载不会写成空缓存。"""
     return (path.exists() and not refresh
-            and pd.Timestamp(path.stat().st_mtime, unit="s").normalize() >= pd.Timestamp(end_date))
+            and pd.Timestamp(path.stat().st_mtime, unit="s", tz="UTC").tz_convert("Asia/Shanghai")
+            .normalize().tz_localize(None) >= pd.Timestamp(end_date))
 
 
 def download_company_data(pool: pd.DataFrame, end_date: str, refresh: bool = False):
     """每股一份缓存；基本面单位为元、比率单位为百分数，EPS/ROE等为年初至今。"""
-    folder = DATA_DIR / "fundamentals"
+    folder = CACHE_DIR / "fundamentals"
     folder.mkdir(exist_ok=True)
     reports, raw_prices, dividends = [], [], []
     for i, item in pool.reset_index(drop=True).iterrows():
@@ -472,9 +474,9 @@ def download_company_data(pool: pd.DataFrame, end_date: str, refresh: bool = Fal
     for column in ("dividend_notice_date", "ex_dividend_date"):
         dividends[column] = pd.to_datetime(dividends[column], errors="coerce")
     dividends["cash_per_share"] = pd.to_numeric(dividends["cash_per_10_shares"], errors="coerce") / 10
-    reports.to_csv(DATA_DIR / "financial_reports.csv", index=False, encoding="utf-8-sig")
-    raw_prices.to_csv(DATA_DIR / "valuation_prices.csv", index=False, encoding="utf-8-sig")
-    dividends.to_csv(DATA_DIR / "dividend_events.csv", index=False, encoding="utf-8-sig")
+    reports.to_csv(CACHE_DIR / "financial_reports.csv", index=False, encoding="utf-8-sig")
+    raw_prices.to_csv(CACHE_DIR / "valuation_prices.csv", index=False, encoding="utf-8-sig")
+    dividends.to_csv(CACHE_DIR / "dividend_events.csv", index=False, encoding="utf-8-sig")
     return reports, raw_prices, dividends
 
 
@@ -487,6 +489,8 @@ def latest_report_events(reports: pd.DataFrame) -> pd.DataFrame:
 
 def match_company_data(prices, reports, raw_prices, dividends):
     """按09:00时点回看财报；估值用当日未复权收盘价，保持原项目收盘后使用的场景。"""
+    prices["signal_time"] = pd.to_datetime(prices["signal_time"]).astype("datetime64[ns]")
+    reports["financial_available_at"] = pd.to_datetime(reports["financial_available_at"]).astype("datetime64[ns]")
     prices = prices.merge(raw_prices, on=["date", "code"], how="left", validate="one_to_one")
     # 新浪原始成交量/换手率可还原流通股本；这是估计流通股数，不是总股本。
     prices["float_shares_estimate"] = prices["volume"] / prices["turnover"].where(prices["turnover"] > 0)
@@ -496,7 +500,7 @@ def match_company_data(prices, reports, raw_prices, dividends):
         report = reports[reports["code"] == code].drop(columns="code")
         stock = pd.merge_asof(stock, latest_report_events(report), left_on="signal_time",
                               right_on="financial_available_at", direction="backward")
-        # 保留最近已可用年报及全年EPS；PE-TTM另外读取每日估值，不用季报EPS代替。
+        # PE采用静态口径：最后一份当时已经可用的年报EPS，不把季报EPS当全年EPS。
         annual = report[report["financial_report_date"].dt.month == 12]
         annual = latest_report_events(annual)[["financial_report_date", "financial_available_at", "eps_ytd"]]
         annual = annual.rename(columns={"financial_report_date": "annual_report_date",
@@ -515,7 +519,9 @@ def match_company_data(prices, reports, raw_prices, dividends):
 
     prices = pd.concat(pieces, ignore_index=True).copy()
     positive_price = prices["unadjusted_close"].where(prices["unadjusted_close"] > 0)
+    positive_eps = prices["eps_annual"].where(prices["eps_annual"] > 0)
     positive_book = prices["book_value_per_share"].where(prices["book_value_per_share"] > 0)
+    prices["pe_static"] = positive_price / positive_eps
     prices["pb"] = positive_price / positive_book
     prices["book_to_market"] = positive_book / positive_price
     prices["dividend_yield_365d_pct"] = prices["cash_dividend_365d"] / positive_price * 100
@@ -523,56 +529,9 @@ def match_company_data(prices, reports, raw_prices, dividends):
     return prices
 
 
-def download_pe_ttm(pool, end_date, refresh=False):
-    """读取东方财富历史每日PE-TTM；每股缓存，失败直接报错，不混用静态PE。"""
-    folder = DATA_DIR / "fundamentals"
-    folder.mkdir(exist_ok=True)
-    frames = []
-    session = requests.Session()
-    for i, code in enumerate(pool["code"], start=1):
-        code = str(code).zfill(6)
-        print(f"[PE-TTM {i:03d}/{len(pool)}] {code}", flush=True)
-        path = folder / f"{code}_pe_ttm.csv"
-        if fresh_cache(path, end_date, refresh):
-            frame = pd.read_csv(path, parse_dates=["date"], dtype={"code": str})
-        else:
-            # 与ak.stock_value_em同一数据源；只取所需列并设超时，避免接口无限等待。
-            response = session.get("https://datacenter-web.eastmoney.com/api/data/v1/get",
-                params={"reportName": "RPT_VALUEANALYSIS_DET", "columns": "SECURITY_CODE,TRADE_DATE,PE_TTM",
-                        "filter": f'(SECURITY_CODE="{code}")', "sortColumns": "TRADE_DATE",
-                        "sortTypes": "-1", "pageSize": "5000", "pageNumber": "1",
-                        "source": "WEB", "client": "WEB", "_": int(time.time() * 1000)}, timeout=30)
-            response.raise_for_status()
-            raw = pd.DataFrame(response.json()["result"]["data"])
-            frame = raw.rename(columns={"TRADE_DATE": "date", "PE_TTM": "pe_ttm"})[["date", "pe_ttm"]].copy()
-            frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
-            frame["pe_ttm"] = pd.to_numeric(frame["pe_ttm"], errors="coerce")
-            frame["code"] = code
-            frame = frame.dropna(subset=["date"]).drop_duplicates("date").sort_values("date")
-            frame.to_csv(path, index=False, encoding="utf-8-sig")
-            time.sleep(0.2)
-        frames.append(frame[frame["date"].between(pd.Timestamp(START_DATE), pd.Timestamp(end_date))])
-    session.close()
-    data = pd.concat(frames, ignore_index=True)
-    data.to_csv(DATA_DIR / "valuation_ttm.csv", index=False, encoding="utf-8-sig")
-    data.to_parquet(DATA_DIR / "valuation_ttm.parquet", index=False, compression="zstd")
-    return data
-
-
-def match_pe_ttm(prices, valuations):
-    """按股票和当日交易日期匹配收盘PE-TTM；非正值留空，其余列不变。"""
-    prices = prices.drop(columns=["pe_static", "pe_ttm"], errors="ignore")
-    values = valuations[["date", "code", "pe_ttm"]].copy()
-    values["pe_ttm"] = values["pe_ttm"].where(values["pe_ttm"] > 0)
-    prices = prices.merge(values, on=["date", "code"], how="left", validate="one_to_one")
-    pe_ttm = prices.pop("pe_ttm")
-    prices.insert(prices.columns.get_loc("pb"), "pe_ttm", pe_ttm)
-    return prices
-
-
 def download_macro_data(end_date: str, refresh: bool = False):
     """原始利率保持百分数；GDP只匹配有发布日期的序列，不猜测新季度的公布日期。"""
-    paths = {name: DATA_DIR / f"{name}.csv" for name in
+    paths = {name: CACHE_DIR / f"{name}.csv" for name in
              ("shibor", "treasury_yields", "gdp_releases", "gdp_quarterly")}
     if fresh_cache(paths["shibor"], end_date, refresh):
         shibor = pd.read_csv(paths["shibor"])
@@ -606,11 +565,12 @@ def download_macro_data(end_date: str, refresh: bool = False):
 
 
 def match_macro_data(daily, shibor, bonds, gdp):
-    shibor["shibor_date"] = pd.to_datetime(shibor["shibor_date"])
+    daily["signal_time"] = pd.to_datetime(daily["signal_time"]).astype("datetime64[ns]")
+    shibor["shibor_date"] = pd.to_datetime(shibor["shibor_date"]).astype("datetime64[ns]")
     shibor["shibor_available_at"] = shibor["shibor_date"] + pd.Timedelta(days=1, hours=9)
     daily = pd.merge_asof(daily, shibor.sort_values("shibor_available_at"), left_on="signal_time",
                           right_on="shibor_available_at", direction="backward")
-    bonds["yield_date"] = pd.to_datetime(bonds["yield_date"])
+    bonds["yield_date"] = pd.to_datetime(bonds["yield_date"]).astype("datetime64[ns]")
     for country in ("cn", "us"):
         columns = [f"{country}_yield_{years}y_pct" for years in (2, 5, 10, 30)]
         rates = bonds[["yield_date", *columns]].dropna(subset=columns, how="all").copy()
@@ -626,7 +586,7 @@ def match_macro_data(daily, shibor, bonds, gdp):
                               right_on=time_name, direction="backward")
         daily[f"{country}_term_spread_10y_2y_pp"] = daily[columns[2]] - daily[columns[0]]
     daily["cn_us_spread_10y_pp"] = daily["cn_yield_10y_pct"] - daily["us_yield_10y_pct"]
-    gdp["gdp_release_date"] = pd.to_datetime(gdp["gdp_release_date"])
+    gdp["gdp_release_date"] = pd.to_datetime(gdp["gdp_release_date"]).astype("datetime64[ns]")
     gdp["cn_gdp_yoy_pct"] = pd.to_numeric(gdp["cn_gdp_yoy_pct"], errors="coerce")
     gdp = gdp.dropna(subset=["gdp_release_date", "cn_gdp_yoy_pct"])
     gdp["gdp_available_at"] = gdp["gdp_release_date"] + pd.Timedelta(days=1, hours=9)
@@ -666,7 +626,7 @@ def make_calendar_data(dates):
     for column in ("closed_weekdays_after", "is_before_holiday"):
         calendar.loc[following.loc[calendar.index].isna(), column] = float("nan")
     calendar["signal_time"] = calendar["date"] + pd.Timedelta(hours=9)
-    calendar.to_csv(DATA_DIR / "calendar.csv", index=False, encoding="utf-8-sig")
+    calendar.to_csv(CACHE_DIR / "calendar.csv", index=False, encoding="utf-8-sig")
     return calendar.reset_index(drop=True)
 
 
@@ -674,7 +634,7 @@ def download_global_indices(end_date: str, refresh: bool = False):
     """Yahoo价格指数日线；保留应有但缺失的交易日，不用前值冒充下载成功。"""
     import exchange_calendars as xcals
 
-    folder = DATA_DIR / "global_indices"
+    folder = CACHE_DIR / "global_indices"
     folder.mkdir(exist_ok=True)
     frames = {}
     start = pd.Timestamp(START_DATE) - pd.Timedelta(days=40)
@@ -715,8 +675,11 @@ def download_global_indices(end_date: str, refresh: bool = False):
 
 def match_global_data(daily, frames):
     """先对齐统一A股09:00时点，再匹配个股；长假变化可由相邻可见收盘价累计得到。"""
+    daily["signal_time"] = pd.to_datetime(daily["signal_time"]).astype("datetime64[ns]")
     for name, frame in frames.items():
-        frame = frame.sort_values("available_at").copy()
+        frame = frame.copy()
+        frame["available_at"] = pd.to_datetime(frame["available_at"]).astype("datetime64[ns]")
+        frame = frame.sort_values("available_at")
         frame["new_sessions"] = range(1, len(frame) + 1)
         frame["missing_count"] = frame["close"].isna().cumsum()
         columns = ["source_date", "available_at", "open", "high", "low", "close", "volume",
@@ -741,8 +704,8 @@ def write_data_structure(prices):
                "全球指数": "Yahoo Finance日线 + exchange-calendars；收盘加1小时后可用",
                "A股日历": "AkShare/新浪交易日历；临时休市未还原事前公告版本",
                "宏观": "AkShare：Shibor、中美国债、带发布日期的GDP同比",
-               "基本面与估值": "AkShare/东方财富财报及每日PE-TTM、未复权价格与分红"}
-    calendar_fields = set(pd.read_csv(DATA_DIR / "calendar.csv", nrows=0).columns) - {"date"}
+               "基本面与估值": "AkShare/东方财富财报、新浪未复权价格及分红；PE为静态口径"}
+    calendar_fields = set(pd.read_csv(CACHE_DIR / "calendar.csv", nrows=0).columns) - {"date"}
     original = {"date", "code", "name", "open", "high", "low", "close", "volume", "amount", "turnover"}
     for column in prices.columns:
         if column in original:
@@ -763,13 +726,13 @@ def write_data_structure(prices):
             unit = "百分数，例如5表示5%"
         elif column.endswith("_pp"):
             unit = "百分点"
-        elif column in {"pe_ttm", "pb", "book_to_market"}:
+        elif column in {"pe_static", "pb", "book_to_market"}:
             unit = "倍/比值"
         rows.append({"group": group, "field": column, "dtype": str(prices[column].dtype),
                      "source_and_basis": sources[group], "unit": unit,
                      "missing_pct": round((1 - valid.mean()) * 100, 3),
                      "latest_valid_stock_date": prices.loc[valid, "date"].max()})
-    pd.DataFrame(rows).to_csv(DATA_DIR / "data_structure.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame(rows).to_csv(CACHE_DIR / "data_structure.csv", index=False, encoding="utf-8-sig")
 
 
 def add_extra_data(prices, pool, end_date=None, refresh=False):
@@ -784,24 +747,87 @@ def add_extra_data(prices, pool, end_date=None, refresh=False):
     daily = make_calendar_data(prices["date"].unique())
     daily = match_macro_data(daily, *download_macro_data(end_date, refresh))
     daily = match_global_data(daily, download_global_indices(end_date, refresh))
-    daily.to_csv(DATA_DIR / "daily_context.csv", index=False, encoding="utf-8-sig")
+    daily.to_csv(CACHE_DIR / "daily_context.csv", index=False, encoding="utf-8-sig")
     prices = prices.merge(daily, on="date", how="left", validate="many_to_one")
     prices = match_company_data(prices, *download_company_data(pool, end_date, refresh))
-    prices = match_pe_ttm(prices, download_pe_ttm(pool, end_date, refresh))
     prices = prices.sort_values(["date", "code"]).reset_index(drop=True)
     write_data_structure(prices)
-    # 所有类别下载和匹配成功后才替换主表，中途失败仍保留原prices.csv。
-    prices.to_csv(DATA_DIR / "prices.csv", index=False, encoding="utf-8-sig")
-    prices.to_parquet(DATA_DIR / "prices.parquet", index=False, compression="zstd")
     print(f"数据补充完成：{len(prices):,}行，{prices['code'].nunique()}只股票，{len(prices.columns)}列。", flush=True)
     return prices
 
 
-if __name__ == "__main__":
+def save_prices_parquet(prices: pd.DataFrame, output_path: Path | None = None) -> Path:
+    """所有来源完整合并、字段校验与临时文件回读成功后，原子替换主表。"""
+    from extended_factors import CATALOG
+
+    prices = validate_prices(prices)
+    required = set().union(*(set(spec["source_fields"].split(",")) for spec in CATALOG.values()))
+    required.add("market")
+    missing = required - set(prices.columns)
+    if missing:
+        raise ValueError(f"合并数据缺少后续因子字段，保留旧Parquet：{sorted(missing)}")
+    # 统一日期类型，避免CSV缓存把部分时间戳变为字符串；不更改数据匹配口径。
+    for column in prices:
+        if column == "date" or column.endswith(("_date", "_available_at")) or column == "signal_time":
+            prices[column] = pd.to_datetime(prices[column], errors="raise").astype("datetime64[ns]")
+    target = Path(output_path) if output_path is not None else PRICE_FILE
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(prefix=f".{target.stem}_", suffix=".parquet", dir=target.parent)
+    os.close(descriptor)
+    temporary = Path(name)
+    old_mode = target.stat().st_mode if target.exists() else None
+    made_writable = False
+    try:
+        prices.to_parquet(temporary, index=False, engine="pyarrow", compression="snappy")
+        import pyarrow.parquet as pq
+        metadata = pq.ParquetFile(temporary).metadata
+        if metadata.num_rows != len(prices) or metadata.num_columns != len(prices.columns):
+            raise ValueError("临时Parquet行列数校验失败，保留旧文件")
+        # 原项目主表带Windows只读属性。仅在新文件完整写好后解除目标的只读属性。
+        if old_mode is not None and not old_mode & stat.S_IWRITE:
+            target.chmod(old_mode | stat.S_IWRITE)
+            made_writable = True
+        os.replace(temporary, target)
+    except Exception:
+        if made_writable and target.exists():
+            target.chmod(old_mode)
+        raise
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target
+
+
+def download_dataset(n_stocks: int = 300, end_date: str | None = None,
+                     refresh: bool = False, output_path: Path | None = None) -> Path:
+    """在线入口：股票池→行情→行业/大盘→财报/宏观/日历/全球→完整Parquet。"""
+    if not 1 <= n_stocks <= 300:
+        raise ValueError("下载股票数必须为1至300")
+    prepare_folders()
+    end_date = get_end_date(end_date)
+    if pd.Timestamp(end_date) < pd.Timestamp(START_DATE):
+        raise ValueError(f"截止日期不能早于{START_DATE}")
+    pool = get_stock_pool(n_stocks=n_stocks, refresh=refresh)
+    if pool.empty:
+        raise ValueError("在线接口返回空股票池，保留旧Parquet")
+    prices = download_prices(pool, end_date=end_date, refresh=refresh)
+    prices = add_market_context(prices, pool, end_date=end_date, refresh=refresh)
+    if set(prices["code"]) != set(pool["code"]):
+        raise ValueError("合并数据与股票池不一致，保留旧Parquet")
+    path = save_prices_parquet(prices, output_path)
+    print(f"下载合并完成：{path}；{len(prices):,}行，{prices['code'].nunique()}只股票，{len(prices.columns)}列。", flush=True)
+    return path
+
+
+def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="只补充基本面、宏观、日历和全球指数，不训练模型")
-    parser.add_argument("--refresh", action="store_true", help="重新下载新增数据，默认复用同日缓存")
+    parser = argparse.ArgumentParser(description="在线下载完整数据并生成根目录prices.parquet，不训练模型")
+    parser.add_argument("--stocks", type=int, default=300, help="沪深300成分股数量，默认300，按代码排序")
+    parser.add_argument("--end-date", default=None, help="下载截止日期，格式YYYYMMDD")
+    parser.add_argument("--refresh", action="store_true", help="忽略原始缓存，重新下载全部来源")
     args = parser.parse_args()
-    pool = pd.read_csv(DATA_DIR / "stock_pool.csv", dtype={"code": str})
-    add_extra_data(load_prices(), pool, refresh=args.refresh)
+    download_dataset(args.stocks, args.end_date, args.refresh)
+
+
+if __name__ == "__main__":
+    main()

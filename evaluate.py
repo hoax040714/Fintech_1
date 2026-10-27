@@ -3,8 +3,9 @@
 import numpy as np
 import pandas as pd
 
-from data import RESULT_DIR
-from factors import FEATURES, HORIZONS
+from price_source import RESULT_DIR
+from factors import CROSS_SECTION_FEATURES, HORIZONS
+from extended_factors import DAILY_FEATURES
 
 
 def calculate_factor_ic(features: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -16,7 +17,8 @@ def calculate_factor_ic(features: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFr
         mature = features.dropna(subset=[target])
 
         for date, day in mature.groupby("date"):
-            factor_values = day[FEATURES]
+            # 宏观/日历/全球共同因子同日没有横截面差异，不能用截面IC评估。
+            factor_values = day[CROSS_SECTION_FEATURES]
             counts = factor_values.notna().sum()
             correlations = factor_values.corrwith(day[target])
             valid = correlations[(counts >= 10) & correlations.notna()]
@@ -43,6 +45,31 @@ def calculate_factor_ic(features: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFr
     daily.to_csv(RESULT_DIR / "factor_ic_daily.csv", index=False, encoding="utf-8-sig")
     summary.to_csv(RESULT_DIR / "factor_ic_summary.csv", index=False, encoding="utf-8-sig")
     return daily, summary
+
+
+def calculate_time_factor_ic(features: pd.DataFrame) -> pd.DataFrame:
+    """共同因子对股票池等权未来收益的时间序列IC；训练/验证/测试分开计算。"""
+    common = features.groupby("date", sort=True)[DAILY_FEATURES].first()
+    rows = []
+    for horizon in HORIZONS:
+        target = features.groupby("date")[f"future_return_{horizon}d"].mean()
+        sample = common.join(target.rename("target")).dropna(subset=["target"])
+        dates = sample.index
+        cut1, cut2 = int(len(dates) * .70), int(len(dates) * .85)
+        partitions = {"train": dates[:max(0, cut1 - horizon)],
+                      "validation": dates[cut1:max(cut1, cut2 - horizon)], "test": dates[cut2:]}
+        for partition, selected in partitions.items():
+            part = sample.loc[selected]
+            for factor in DAILY_FEATURES:
+                pair = part[[factor, "target"]].dropna()
+                valid = len(pair) >= 20 and pair[factor].nunique() > 1 and pair["target"].nunique() > 1
+                rows.append({"horizon": horizon, "factor": factor, "partition": partition,
+                             "ic": pair[factor].corr(pair["target"]) if valid else np.nan,
+                             "n_dates": len(pair), "ic_scope": "time_series",
+                             "target": "股票池当日有成熟标签股票的等权未来收益"})
+    summary = pd.DataFrame(rows)
+    summary.to_csv(RESULT_DIR / "factor_time_ic_summary.csv", index=False, encoding="utf-8-sig")
+    return summary
 
 
 def run_backtest(

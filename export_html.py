@@ -4,6 +4,9 @@ from pathlib import Path
 import json
 
 import pandas as pd
+from price_source import load_prices, source_signature, FACTOR_CATALOG_FILE
+from factors import FEATURES
+from factor_selection import PREPROCESSING_VERSION
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -97,13 +100,16 @@ def metric(label: str, value: str) -> str:
 
 def main() -> None:
     latest = pd.read_csv(RESULT_DIR / "latest_predictions.csv", dtype={"code": str})
-    prices = pd.read_csv(DATA_DIR / "prices.csv", parse_dates=["date"], dtype={"code": str})
+    prices = load_prices(columns=[])
     metrics = pd.read_csv(RESULT_DIR / "model_metrics.csv")
     factor_ic = pd.read_csv(RESULT_DIR / "factor_ic_summary.csv")
-    factor_catalog = pd.read_csv(DATA_DIR / "factor_catalog.csv")
+    factor_catalog = pd.read_csv(FACTOR_CATALOG_FILE)
     backtest = pd.read_csv(RESULT_DIR / "backtest_nav.csv", parse_dates=["date"])
     backtest_summary = pd.read_csv(RESULT_DIR / "backtest_summary.csv")
     metadata = json.loads((RESULT_DIR / "metadata.json").read_text(encoding="utf-8"))
+    if (metadata.get("features") != FEATURES or metadata.get("source_sha256") != source_signature()
+            or metadata.get("preprocessing_version") != PREPROCESSING_VERSION):
+        raise ValueError("现有训练结果与Parquet/因子版本不一致，请先运行 python main.py")
 
     latest["code"] = latest["code"].str.zfill(6)
     prices["code"] = prices["code"].str.zfill(6)

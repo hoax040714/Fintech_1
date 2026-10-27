@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
-
-from models import MODEL_LABELS
+from price_source import load_prices, source_signature, FACTOR_CATALOG_FILE
+from factors import FEATURES
+from factor_selection import PREPROCESSING_VERSION
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -323,29 +325,30 @@ hr { border-color: rgba(255,255,255,.11); }
 )
 
 
-@st.cache_data(show_spinner=False, ttl=300)
+@st.cache_data(show_spinner=False)
+def _read_csv_cached(path: str, mtime_ns: int, code_as_str: bool = False) -> pd.DataFrame:
+    """修改时间进入缓存键，训练重写CSV后自动读取新结果。"""
+    kwargs = {"dtype": {"code": str}} if code_as_str else {}
+    return pd.read_csv(path, **kwargs)
+
+
 def read_result(name: str) -> pd.DataFrame:
     path = RESULT_DIR / name
     if not path.exists():
         return pd.DataFrame()
-    kwargs = {"dtype": {"code": str}} if name in {"latest_predictions.csv", "test_predictions.csv"} else {}
-    return pd.read_csv(path, **kwargs)
+    code_as_str = name in {"latest_predictions.csv", "test_predictions.csv"}
+    return _read_csv_cached(str(path), path.stat().st_mtime_ns, code_as_str)
 
 
-@st.cache_data(show_spinner=False, ttl=300)
-def read_prices() -> pd.DataFrame:
-    path = DATA_DIR / "prices.csv"
-    if not path.exists():
-        return pd.DataFrame()
-    data = pd.read_csv(path, parse_dates=["date"], dtype={"code": str})
-    data["code"] = data["code"].str.zfill(6)
-    return data
+@st.cache_data(show_spinner=False)
+def read_prices(source_sha256: str) -> pd.DataFrame:
+    # 文件指纹作为Streamlit缓存键，源文件更新后不会复用旧行情。
+    return load_prices(columns=[])
 
 
-@st.cache_data(show_spinner=False, ttl=300)
 def read_factor_catalog() -> pd.DataFrame:
-    path = DATA_DIR / "factor_catalog.csv"
-    return pd.read_csv(path) if path.exists() else pd.DataFrame()
+    path = FACTOR_CATALOG_FILE
+    return _read_csv_cached(str(path), path.stat().st_mtime_ns) if path.exists() else pd.DataFrame()
 
 
 def pct(value: float) -> str:
@@ -525,12 +528,15 @@ importance = read_result("feature_importance.csv")
 factor_catalog = read_factor_catalog()
 
 if metrics.empty or latest.empty:
-    st.error("尚未发现训练结果。请先在项目目录运行 `python main.py --refresh`。")
+    st.error("尚未发现训练结果。请先在项目目录运行 `python main.py`。")
     st.stop()
 
-prices = read_prices()
-if not prices.empty and pd.to_datetime(latest["date"]).max() < prices["date"].max():
-    st.info("行情范围已更新，当前预测与评估仍来自上次训练。完整运行 main.py 后将显示新范围的结果。")
+metadata_path = RESULT_DIR / "metadata.json"
+metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
+if (metadata.get("features") != FEATURES or metadata.get("source_sha256") != source_signature()
+        or metadata.get("preprocessing_version") != PREPROCESSING_VERSION):
+    st.warning("现有预测来自旧数据或旧因子版本。请运行 `python main.py` 重新训练后查看；仅生成因子不会更新预测。")
+    st.stop()
 
 tab1, tab2, tab3, tab4 = st.tabs(["首页预测", "模型表现", "因子表现", "策略回测"])
 
@@ -540,7 +546,7 @@ with tab1:
         f1, f2, f3, f4 = st.columns([1.1, 1.1, 1.5, 0.8], vertical_alignment="bottom")
         horizons = sorted(int(x) for x in latest["horizon"].unique())
         horizon = f1.selectbox("预测周期", horizons, format_func=lambda x: f"{x} 个交易日")
-        labels = MODEL_LABELS
+        labels = {"random_forest": "Random Forest", "ridge": "Ridge", "lasso": "Lasso"}
         model_names = [m for m in labels if m in set(latest["model"])]
         model = f2.selectbox("模型", model_names, format_func=lambda x: labels[x])
         subset0 = latest[(latest["horizon"] == horizon) & (latest["model"] == model)].copy()
@@ -560,7 +566,7 @@ with tab1:
     c4.metric("预测方向", "上涨" if row["predicted_return"] > 0 else "下跌或持平")
 
     st.markdown(f"#### {code} {row['name']} · 历史 K 线与预测终点")
-    prices = read_prices()
+    prices = read_prices(metadata["source_sha256"])
     history = prices[prices["code"] == code].sort_values("date")[
         ["date", "open", "high", "low", "close", "volume"]
     ]
@@ -587,7 +593,7 @@ with tab1:
     )
 
 with tab2:
-    section_header("02 / MODELS", "模型表现比较", f"在相同股票池和测试区间中，比较 {metrics['model'].nunique()} 个模型。")
+    section_header("02 / MODELS", "模型表现比较", "在相同股票池和测试区间中，公平比较三个模型。")
     horizon2 = st.selectbox(
         "预测周期", sorted(int(x) for x in metrics["horizon"].unique()),
         format_func=lambda x: f"{x} 个交易日", key="metric_horizon")
@@ -611,7 +617,7 @@ with tab2:
     table["MAE"] = table["mae"].map(lambda x: f"{x:.2%}")
     table["RMSE"] = table["rmse"].map(lambda x: f"{x:.2%}")
     table["方向准确率"] = table["direction_accuracy"].map(lambda x: f"{x:.1%}")
-    table["模型"] = table["model"].map(MODEL_LABELS)
+    table["模型"] = table["model"].map({"random_forest": "Random Forest", "ridge": "Ridge", "lasso": "Lasso"})
     st.dataframe(
         table[["模型", "best_params", "r2", "MAE", "RMSE", "方向准确率", "prediction_correlation", "test_start", "test_end"]].rename(
             columns={"best_params": "验证集最优参数", "r2": "R²", "prediction_correlation": "预测相关系数", "test_start": "测试开始", "test_end": "测试结束"}),
@@ -619,16 +625,22 @@ with tab2:
     )
 
     st.markdown("#### 模型因子权重 / 重要性")
+    if "importance_method" in importance and importance["importance_method"].eq("pca_squared_loading_proxy").any():
+        st.caption("PCA树模型的原因子重要性按平方载荷分摊，是解释代理；线性模型系数回投影到标准化原因子。")
+    if "stage" in importance:
+        st.caption("重要性对应测试评估阶段模型；生产模型会在全部成熟样本上另行拟合，所选列和PCA维数可能不同。")
+    preprocessing = read_result("preprocessing_summary.csv")
+    if not preprocessing.empty:
+        with st.expander("查看筛选数量、PCA维数和训练阶段"):
+            st.dataframe(preprocessing, use_container_width=True, hide_index=True)
     i1, i2, i3 = st.columns(3)
     chosen_model = i1.selectbox(
         "查看模型", list(view["model"]), key="importance_model",
-        format_func=lambda x: MODEL_LABELS.get(x, x))
+        format_func=lambda x: {"random_forest": "Random Forest", "ridge": "Ridge", "lasso": "Lasso"}[x])
     factor_types = list(factor_catalog["factor_type"].drop_duplicates()) if not factor_catalog.empty else []
     chosen_type = i2.selectbox("因子类型", [*factor_types, "全部因子"], key="importance_type")
     top_count = i3.selectbox("显示数量", [10, 20, 30], index=1, key="importance_count")
     imp = importance[(importance["horizon"] == horizon2) & (importance["model"] == chosen_model)].copy()
-    if "importance_type" in imp.columns and not imp.empty:
-        st.caption(f"权重口径：{imp['importance_type'].iloc[0]}")
     if not factor_catalog.empty:
         imp = imp.merge(factor_catalog, on="factor", how="left")
     else:
@@ -648,6 +660,10 @@ with tab2:
         )
 
 with tab3:
+    time_ic = read_result("factor_time_ic_summary.csv")
+    if not time_ic.empty:
+        with st.expander("宏观、日历和全球共同因子的时间序列IC（与横截面IC分开）"):
+            st.dataframe(time_ic, use_container_width=True, hide_index=True)
     section_header("03 / FACTORS", "因子预测能力", "按所选区间的 |平均 IC| 排名，保留相关方向的正负号。")
     horizon3 = st.selectbox(
         "预测周期", sorted(int(x) for x in factor_summary["horizon"].unique()),
@@ -655,7 +671,8 @@ with tab3:
     daily = factor_daily.copy()
     daily["date"] = pd.to_datetime(daily["date"])
     available = daily[daily["horizon"] == horizon3]
-    factor_types = list(factor_catalog["factor_type"].drop_duplicates()) if not factor_catalog.empty else []
+    cross_catalog = factor_catalog[factor_catalog["factor"].isin(available["factor"].unique())]
+    factor_types = list(cross_catalog["factor_type"].drop_duplicates()) if not cross_catalog.empty else []
     chosen_ic_type = st.selectbox("因子类型", [*factor_types, "全部因子"], key="factor_type")
     if chosen_ic_type != "全部因子":
         factors_in_type = factor_catalog.loc[
@@ -706,7 +723,7 @@ with tab4:
     available_models = list(backtest[backtest["horizon"] == h4]["model"].unique())
     m4 = b2.selectbox(
         "模型", available_models, key="bt_model",
-        format_func=lambda x: MODEL_LABELS.get(x, x))
+        format_func=lambda x: {"random_forest": "Random Forest", "ridge": "Ridge", "lasso": "Lasso"}[x])
     nav = backtest[(backtest["horizon"] == h4) & (backtest["model"] == m4)].copy()
     nav["date"] = pd.to_datetime(nav["date"])
     summary = backtest_summary[(backtest_summary["horizon"] == h4) & (backtest_summary["model"] == m4)].iloc[0]
@@ -725,6 +742,6 @@ with tab4:
 
 st.markdown(
     '<div class="footer-note"><b>方法与风险提示</b><br>'
-    '股票池为沪深300最新一期的全部300只成分股，行情从2020年开始；固定当前成分会带来生存偏差。'
+    '股票池与历史范围取自本地 prices.parquet；固定成分股快照可能带来生存偏差。'
     '前复权历史、模型预测、因子 IC 与回测结果仅用于课程项目，不构成投资建议。</div>',
     unsafe_allow_html=True)

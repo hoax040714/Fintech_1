@@ -3,7 +3,11 @@
 import numpy as np
 import pandas as pd
 
-from data import DATA_DIR
+from price_source import DATA_DIR, FEATURE_FILE, FACTOR_CATALOG_FILE, prepare_folders
+from extended_factors import (
+    CATALOG, EXTRA_FEATURES, DAILY_FEATURES, STOCK_FEATURES,
+    build_daily_factors, build_stock_factors, add_cross_factors, field_usage,
+)
 
 
 HORIZONS = (1, 5, 30, 60)
@@ -180,16 +184,28 @@ FACTOR_DEFINITIONS = {
 }
 FEATURES = [factor for factors in FACTOR_GROUPS.values() for factor in factors]
 
+# 以上137个原有因子的名称、公式、顺序和分类全部保留。新增因子只追加。
+LEGACY_FEATURES = FEATURES.copy()
+for _name, _spec in CATALOG.items():
+    FACTOR_INFO.setdefault(_spec["factor_type"], {})[_name] = _spec["definition"]
+FACTOR_GROUPS = {group: list(items) for group, items in FACTOR_INFO.items()}
+FACTOR_DEFINITIONS.update({name: spec["definition"] for name, spec in CATALOG.items()})
+FEATURES = LEGACY_FEATURES + EXTRA_FEATURES
+CROSS_SECTION_FEATURES = [name for name in FEATURES if name not in set(DAILY_FEATURES)]
+
 
 def factor_catalog() -> pd.DataFrame:
     """返回供结果文件和网页使用的因子分类目录。"""
     return pd.DataFrame(
         [
-            {"factor": factor, "factor_type": factor_type, "definition": definition}
+            {"factor": factor, "factor_type": factor_type, "definition": definition,
+             "is_legacy": factor in LEGACY_FEATURES,
+             "ic_scope": CATALOG.get(factor, {}).get("ic_scope", "cross_section"),
+             "source_fields": CATALOG.get(factor, {}).get("source_fields", "原有量价/市场行业字段")}
             for factor_type, items in FACTOR_INFO.items()
             for factor, definition in items.items()
         ]
-    )
+    ).set_index("factor").loc[FEATURES].reset_index()
 
 
 def add_price_factors(stock: pd.DataFrame, close: pd.Series, returns: pd.Series) -> None:
@@ -499,9 +515,15 @@ def add_market_industry_factors(
         - _rolling_log_zscore(industry_amount)
     )
 
-def make_features(prices: pd.DataFrame) -> pd.DataFrame:
-    """按股票构建137个因子，并生成未来1、5、30和60日收益率。"""
+def make_features(prices: pd.DataFrame, save: bool = True) -> pd.DataFrame:
+    """原137个因子原样计算，追加新因子；标签仍为未来1/5/30/60日收益。"""
+    prepare_folders()
+    daily = build_daily_factors(prices).astype("float32")
     pieces = []
+    required = set().union(*(set(spec["source_fields"].split(",")) for spec in CATALOG.values()))
+    missing = required - set(prices.columns)
+    if missing:
+        raise ValueError(f"Parquet缺少新增因子所需字段：{sorted(missing)}")
 
     for _, stock in prices.groupby("code", sort=False):
         stock = stock.sort_values("date").copy()
@@ -513,20 +535,55 @@ def make_features(prices: pd.DataFrame) -> pd.DataFrame:
         add_volatility_factors(stock, close, returns)
         add_momentum_factors(stock, close)
         add_reversal_factors(stock, close, returns)
+        stock = stock.copy()
         add_alpha_factors(stock, close, returns)
         add_market_industry_factors(stock, close, returns)
+
+        # 原函数结束后统一拼接，减少逐列添加导致的DataFrame碎片。
+        stock = pd.concat([stock, build_stock_factors(stock).astype("float32")], axis=1)
+        stock = stock.join(daily, on="date", validate="many_to_one")
 
         for horizon in HORIZONS:
             stock[f"future_return_{horizon}d"] = close.shift(-horizon) / close - 1
 
-        pieces.append(stock)
+        stock["_raw_market_return"] = stock["market_return_1d"]
+        stock["_raw_industry_return"] = stock["industry_return_1d"]
+        # 不把215列原始宽表重复保存进因子文件；原始数据始终在prices.parquet。
+        keep = list(dict.fromkeys([
+            "date", "code", "name", "close", "industry", "_raw_market_return", "_raw_industry_return",
+            *LEGACY_FEATURES, *STOCK_FEATURES, *DAILY_FEATURES,
+            *[f"future_return_{h}d" for h in HORIZONS],
+        ]))
+        pieces.append(stock[keep].copy())
+        if len(pieces) % 50 == 0:
+            print(f"因子构建：{len(pieces)}/{prices['code'].nunique()}只股票", flush=True)
 
-    features = pd.concat(pieces, ignore_index=True).replace([np.inf, -np.inf], np.nan)
-    features = features.sort_values(["date", "code"])
-    features.to_csv(DATA_DIR / "features.csv", index=False, encoding="utf-8-sig")
-    factor_catalog().to_csv(DATA_DIR / "factor_catalog.csv", index=False, encoding="utf-8-sig")
+    features = pd.concat(pieces, ignore_index=True)
+    pieces.clear()
+    features = features.replace([np.inf, -np.inf], np.nan)
+    features = features.sort_values(["date", "code"]).reset_index(drop=True)
+    features = add_cross_factors(features, features["industry"])
+    for name in EXTRA_FEATURES:
+        features[name] = features[name].astype("float32")
+    keep = list(dict.fromkeys(["date", "code", "name", "close", *FEATURES,
+                              *[f"future_return_{h}d" for h in HORIZONS]]))
+    features = features[keep]
+    if save:
+        features.to_parquet(FEATURE_FILE, index=False, engine="pyarrow")
+        write_feature_reports(features, prices)
     return features
 
 
+def write_feature_reports(features: pd.DataFrame, prices: pd.DataFrame) -> None:
+    """独立输出目录、原始字段用途和质量表；保留只读的历史因子目录。"""
+    prepare_folders()
+    factor_catalog().to_csv(FACTOR_CATALOG_FILE, index=False, encoding="utf-8-sig")
+    field_usage(prices).to_csv(DATA_DIR / "field_usage.csv", index=False, encoding="utf-8-sig")
+    audit = pd.DataFrame([{"factor": name, "missing_pct": features[name].isna().mean() * 100,
+                           "n_unique": features[name].nunique()} for name in FEATURES])
+    audit = audit.merge(factor_catalog(), on="factor", validate="one_to_one")
+    audit.to_csv(DATA_DIR / "factor_quality.csv", index=False, encoding="utf-8-sig")
+
+
 def load_features() -> pd.DataFrame:
-    return pd.read_csv(DATA_DIR / "features.csv", parse_dates=["date"], dtype={"code": str})
+    return pd.read_parquet(FEATURE_FILE, engine="pyarrow")
