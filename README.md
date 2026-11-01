@@ -1,120 +1,209 @@
-# 沪深300成分股收益预测
+# 股票收益预测：417因子模型实验
 
-这是一个尽量简单、可读的课程项目：使用 AkShare 获取2020年1月1日至最近收盘日的沪深300全部成分股前复权日频行情，匹配行业和大盘数据，构造137个因子，比较10个传统模型，并可选运行4个神经网络及预训练表格模型。Streamlit 展示预测、模型表现、分类因子 IC 和回测。
+当前 `main.py` 使用 `prices.parquet` 对应的全部股票及 `data/features.parquet` 的全部记录进行模型实验。当前两张表均有300只股票、471,813行；运行时按文件内容确定股票池，不再使用固定股票名单或 `--codes` 子集入口。它不下载行情，也不重新计算因子。
 
-## 数据口径
+随附 `prices.parquet` 包含300只股票、471,813行、215列，日期为2020-01-02至2026-10-13；`data/features.parquet` 有471,813行、425列，包含417个因子和未来1/5/30/60个交易观察后的收益标签。
 
-- 每次运行从中证指数最新成分股名单获取沪深300全部300只股票，不用较旧的权重表决定样本。
-- 行情从2020-01-01开始，截止日默认取运行当天。北京时间15:30之前排除当日日线，节假日及数据源延迟以实际返回的交易日为准。
-- 每只股票从申万一级行业的当前成分股表反查所属行业，按“日期+行业”匹配行业日线；大盘统一使用沪深300，按日期匹配。
-- 过期的个股、行业和大盘行情缓存会重新下载；读取后按指定日期范围筛选，避免混入2020年以前的数据。
-- 固定使用当前成分股会有生存偏差；本项目适合课程演示，不适合据此下实盘结论。
-- 预测目标为未来 1、5、30、60 个交易日的简单收益率。
+## 当前运行状态
 
-## 137 个分类因子
+- 统一使用上级环境 `D:\Pycharm gyh\.venv\Scripts\python.exe`（Python 3.13.2）。项目内原 `.venv` 保留并忽略。
+- 上级环境中的LightGBM、Streamlit 1.66.1、Plotly 7.1.0已可用；在线下载和可选模型依赖按所用功能另行验证。
+- `.runtime-deps`、`.download-deps` 中含Python 3.12专用组件，不能直接加入Python 3.13环境。
+- 随附 `results/metadata.json` 属于旧的50只股票、100因子实验，最新行情日期为2026-09-30；417因子版本尚未完成正式重训。
+- 网页和HTML已适配当前实验输出。当前尚无正式全量重训结果，旧结果会显示清楚的等待提示，不会冒充当前实验。
 
-因子分为价格类15个、成交量与流动性类18个、波动率类16个、动量类10个、反转类11个、Alpha组合类30个、市场与行业类37个。名称、类别和定义统一保存在 `data/factor_catalog.csv`，构建公式集中在 `factors.py`。市场与行业类使用匹配后的行业、沪深300价量字段，包括市场及行业状态、相对收益、Beta、相关性与量能共振；本次仅调整数据范围，保留所有现有公式。
+## 本机环境配置
 
-## 模型
+在PyCharm的项目Python解释器设置中选择上级环境 `D:\Pycharm gyh\.venv\Scripts\python.exe`，运行配置使用项目默认解释器，工作目录设为 `D:\Pycharm gyh\Fintech_1`。
 
-默认运行 Lasso、Ridge、Random Forest、OLS（弱Ridge）、OLS3（双因子）、PLS、ElasticNet、GBRT、LightGBM 和 XGBoost。Lasso、Ridge、Random Forest 保留本项目原参数，参考目录的同类模型不重复加入；其他传统模型沿用参考目录的固定参数。OLS名称沿用参考代码，但实际上是 `Ridge(alpha=0.0001)`；OLS3实际上只使用训练期相关性最高的2个因子，不能解释为三因子财务模型。
-
-LSTM、Transformer、RealMLP、TabPFN通过参数选用，默认不运行。OLS3只使用2个因子，这4个可选模型使用训练期筛选的前30个因子，其余传统模型使用全部训练期可用因子。筛选、填补和标准化均不接触测试期标签。TabPFN每次拟合只抽样128条允许训练的记录，预测批次为32条，抽样数量会写进结果说明。
-
-LSTM与Transformer使用每只股票自己的20日历史窗口。网络结构沿用参考目录，验证集选择训练轮数，再按选出的轮数重新训练；网络权重、预处理统计量和特征顺序都保存在模型文件中。窗口按批次展开，避免将300只股票的全部窗口一次性堆进内存。验证、测试分区各自形成窗口，因此每只股票分区开头19条记录不进入该模型的评价。
-
-## 文件结构
-
-```text
-Fintech_1/
-  data.py             # 股票、行业和大盘数据下载、清洗与匹配
-  factors.py          # 137 个分类因子与未来收益标签
-  models.py           # 模型定义、训练、测试指标与预测
-  evaluate.py         # 因子 IC 与样本外回测
-  main.py             # 主程序入口
-  app.py              # Streamlit 四页展示
-  requirements.txt
-  requirements-neural.txt   # 可选 PyTorch
-  requirements-modern.txt   # 可选 RealMLP / TabPFN
-  data/               # 自动生成的个股、行业、大盘、因子与因子目录 CSV
-  models/             # 自动生成的模型
-  results/            # 指标、预测、IC、净值
-```
-
-## 运行
-
-建议 Python 3.10 以上。
-
-## GitHub与三人协作
-
-本仓库只管理代码、说明文档及网页主题，不包含完整数据、因子CSV、模型权重、训练结果、本地环境或备份。当前电脑在GitHub Desktop中选择 **File → Add local repository → `D:\Fintech_1`**；其他成员克隆同一仓库到自己的文件夹。不要把 `data/` 当作仓库根目录，也不要再嵌套创建同名项目。
-
-首次安装、数据包共享、推荐分工及“任务分支→提交→PR检查→合并main”的简单流程见[团队协作说明](团队协作说明.md)。完整字段说明见[合并大表数据目录](data/合并大表数据目录.md)。克隆代码不会自动带回原数据或预测页面，数据包和网站部署需要分别处理。
-
-### 本地运行命令
+在PyCharm底部Terminal中使用PowerShell，显式调用上级环境即可检查入口，不需要创建新环境：
 
 ```powershell
-cd D:\Fintech_1
-python -m pip install -r requirements.txt
-python main.py --refresh
-streamlit run app.py
+cd 'D:\Pycharm gyh\Fintech_1'
+& '..\.venv\Scripts\python.exe' main.py --help
 ```
 
-第一次需要下载300只股票，耗时取决于数据接口。下载时每只股票单独缓存；若中途断开，再运行不带 `--refresh` 的命令可复用已更新的单股文件：
+下文命令均从项目根目录执行。
+
+`requirements.txt` 包含默认训练所需的LightGBM、XGBoost，以及数据下载、因子处理和网页所需的基础依赖。上级环境是共享环境，缺失依赖需按实际功能补装，本次股票池修改不执行安装。
+
+## 模型实验入口
+
+先查看当前入口支持的参数：
 
 ```powershell
-python main.py
+& '..\.venv\Scripts\python.exe' main.py --help
 ```
 
-只更新股票、行业和大盘数据并完成匹配，不训练模型：
+仅进行1日周期的因子筛选审计，不训练预测模型：
 
 ```powershell
-python main.py --data-only
+& '..\.venv\Scripts\python.exe' main.py --selection-only --horizons 1
 ```
 
-数据范围变更后，原有模型和结果不会自动变成300只股票的新结果，需要完整运行 `python main.py` 后再查看新的预测与评估。
+审计会写入 `results/selection_audit/`，包含训练期因子去留原因和PCA候选维数，不代表验证集最优方案，也不生成新预测。
 
-快速检查代码也可以减少股票数（按股票代码排序截取），但少于10只将无法按当前口径计算横截面 IC：
+单独训练1日周期，或运行全部四个周期：
 
 ```powershell
-python main.py --stocks 12
+& '..\.venv\Scripts\python.exe' main.py --horizons 1
+& '..\.venv\Scripts\python.exe' main.py
 ```
 
-按需运行模型或周期，模型名称用空格分隔：
+以上两条命令是不同的运行选择。只有实验标识相同的成功结果才能合并周期；同周期重跑会替换该周期，其他兼容周期保留。不同数据、股票池或模型配置的结果不会合并，详见下节。
+
+所有股票都进入同一套时间切分、训练、验证、测试和生产拟合流程。启动时核对行情表与因子表的完整“日期+股票代码”主键；少了股票、少了日期或存在重复主键时直接报错，不会退回部分股票实验。
+
+“全股票池”不表示把测试标签提前用于调参。仍保留日期隔离带和未成熟标签过滤；上市较晚或历史不足的股票可能在早期分区没有有效样本。模型指标中的 `n_train_stocks`、`n_validation_stocks`、`n_test_stocks` 记录各分区实际覆盖数。
+
+| 参数 | 作用 |
+|---|---|
+| `--horizons` | 逗号分隔的预测周期，支持1、5、30、60；默认全部 |
+| `--selection-only` | 仅生成筛选审计 |
+| `--neural` | 在默认模型基础上增加LSTM和Transformer的测试评估 |
+| `--modern` | 在默认模型基础上增加RealMLP和TabPFN |
+| `--model-device` | 传给现代表格模型的设备参数，支持 `cpu`、`cuda`，默认 `cpu` |
+| `--nn-seeds` | 神经网络重拟合使用的种子数量，默认3 |
+
+例如，全部股票只运行5日周期：
 
 ```powershell
-python main.py --models lasso ridge lgbm xgb --horizons 1 5
-python -m pip install -r requirements-neural.txt
-python main.py --models lstm transformer --horizons 1 --nn-epochs 8
-python -m pip install -r requirements-modern.txt
-python main.py --models realmlp --horizons 1
-python main.py --neural --modern
+& '..\.venv\Scripts\python.exe' main.py --horizons 5
 ```
 
-`--neural` 增加LSTM和Transformer，`--modern` 只增加RealMLP，同时使用时共运行13个模型。默认运行CPU，具备CUDA环境时可传 `--device cuda`。按使用者选择，TabPFN暂不授权，只保留 `--models tabpfn` 显式入口，不随上述两个开关启动；以后解决官方许可或本地权重后再使用。若已有兼容权重，可在 `models.py` 的 `model_path` 指定路径。
+当前 `main.py` 不支持 `--codes`、`--offline`、`--features-only`、`--data-only`、`--stocks`、`--end-date`、`--refresh` 或 `--mae-tolerance`。不要继续使用旧文档中的这些主程序命令。
 
-每次训练生成的是当次所选模型及周期的一套CSV结果，不自动把不同实验的结果混在一起。默认10模型×4周期为40组结果；全部14模型×4周期为56组。少量股票试运行的结果只用于检查通路，不用于判断模型优劣。
+## 实验版本隔离与历史结果
 
-## 方法说明
+实验标识由行情文件和因子文件的SHA-256、完整股票名单、因子清单、预处理版本、模型选项、训练配置、实现代码及Python/关键依赖版本共同确定。预测周期不参与实验标识，因此相同实验可以先运行1日，再补跑5日。
 
-- 样本按交易日顺序切成约 70% 训练、15% 验证、15% 测试。
-- 训练集和验证集尾部各留出与预测周期相同的隔离带，避免未来收益标签跨越分区。
-- Lasso/Ridge 的缺失值填充与标准化都只在训练数据拟合；随机森林仅做缺失值填充。
-- 超参数用验证集 MAE 选择，最终测试指标不参与调参。
-- 因子 IC 是每日股票横截面的 Pearson 相关系数，再按日期等权平均。
-- 回测只使用测试集预测；每隔预测周期调仓，等权持有预测收益最高的 10 只股票，并扣 0.1% 调仓成本。
+训练期间，CSV和模型只写入 `.experiment_staging/<本次运行编号>/`。当前 `results/`、`saved_models/` 保持原样。全部训练与评价完成后再次检查输入和代码指纹，再统一发布：
 
-## 主要输出
+- 实验标识相同、上次状态完整且产物校验通过：合并兼容周期；本次周期的旧记录被替换，不重复追加。
+- 实验标识不同，或旧版结果没有实验标识：从空结果开始；成功发布时把原结果和模型整套归档到 `experiment_history/<旧实验标识或legacy>/<归档编号>/`。
+- 当前目录的文件缺失或内容与产物清单不符：拒绝自动合并，不静默接受被修改的文件。
+- 训练或评价报错：保留当前成功结果，失败产物留在暂存目录并标记 `failed`。发布阶段出现普通文件操作错误时，尝试回滚目录替换。
+- 同时启动另一份训练会被拒绝，避免两个进程交叉覆盖当前结果。进程退出后操作系统释放文件锁。
 
-- `results/model_metrics.csv`：测试集 MAE、RMSE、R²、方向准确率、预测相关系数。
-- `results/latest_predictions.csv`：每只股票的最新预测与参考目标价。
-- `data/factor_catalog.csv`：137 个因子的类型与中文定义。
-- `results/factor_ic_summary.csv`：137 个因子的平均 IC 排名。
-- `results/feature_importance.csv`：系数、树模型内置重要性、置换重要性或输入层权重，`importance_type` 标明口径；序列网络输入层权重不代表预测重要性。
-- `results/backtest_summary.csv`：策略与等权基准的回测摘要。
+每份结果CSV增加 `experiment_id`、`run_id`。`metadata.json` 与 `run_metadata.json` 统一记录完整实验身份、已完成周期、运行历史、当前产物清单及文件指纹，不再无条件拼接旧元数据。
 
-> 说明：前复权历史会随分红送转而变化。需要严格复现实验时，应保存当次下载的原始文件与股票池文件。
+旧版 `models/` 在首次发布新实验时与旧结果一起保留在历史快照的 `legacy_models/` 中；新生产模型始终位于当前 `saved_models/`。原始 `prices.parquet` 与 `data/` 不参与归档。
 
-模型及参数参考 `D:\模型\模型\models.py`，没有加载或搬用该目录针对两只股票、不同因子顺序拟合的旧模型工件。缺少可选依赖时，Python直接报告原始导入错误；项目未增加 `try/except`、插件注册框架或复杂版本适配。
+例如：相同300股票数据先跑1日、再跑5日，当前结果包含同一实验的1日和5日；数据或配置变化后只跑1日，当前结果仅包含新实验的1日，旧实验留在历史目录。
 
-接入验证已完成10个传统模型、LSTM、Transformer、RealMLP，共13个模型的真实小样本训练、保存和重加载，以及Streamlit四页兼容检查。TabPFN已接入构造与训练入口，但实际下载权重要求用户登录并接受官方许可，目前未完成训练验证。正式300只股票全量训练尚未执行；验证结果单独保存，不覆盖正式结果。
+结果保存检查只使用临时目录与假产物，不拟合真实模型：
+
+```powershell
+& '..\.venv\Scripts\python.exe' -B -m unittest discover -s tests -v
+```
+
+## 模型与可选依赖
+
+默认模型键为 `ols`、`ols_huber`、`ols3`、`pls`、`lasso`、`enet`、`gbrt`、`random_forest`、`lightgbm`、`xgboost`。其中 `ols`、`ols3` 当前用小正则化系数的Ridge实现。
+
+LSTM和Transformer需要额外安装 `torch`；RealMLP和TabPFN需要 `pytabkit`、`tabpfn` 及其依赖。这些可选包不包含在基础依赖文件中：
+
+```powershell
+# 按需安装神经网络依赖
+& '..\.venv\Scripts\python.exe' -m pip install torch
+# 按需安装现代表格模型依赖
+& '..\.venv\Scripts\python.exe' -m pip install pytabkit tabpfn
+```
+
+可选依赖与Python 3.13、GPU的兼容性仍需实际验证。TabPFN在没有本地权重时可能下载模型权重。所有表格模型在各阶段使用完整可用训练分区，TabPFN也不再静默抽取4000行；全量TabPFN的资源消耗较大，完整运行能力尚未验证。当前神经网络分支输出测试指标和测试预测，未保存对应生产模型，也未生成神经网络的最新收益预测。
+
+## 数据更新与因子生成
+
+现有主表和因子表可以直接用于实验。只有需要更新数据时才单独执行以下步骤。
+
+`data.py` 在线下载行情、行业、大盘、财务、宏观、日历和海外指数，合并、校验后替换根目录 `prices.parquet`。其参数为 `--stocks`（默认300）、`--end-date`（YYYYMMDD）和 `--refresh`（忽略缓存）：
+
+```powershell
+& '..\.venv\Scripts\python.exe' data.py --help
+& '..\.venv\Scripts\python.exe' data.py --stocks 300
+```
+
+更新主表后，需要重新生成全股票池因子，才能在模型实验中使用新行情。以下命令会覆盖因子表及质量报告：
+
+```powershell
+& '..\.venv\Scripts\python.exe' -c "from price_source import load_prices; from factors import make_features; make_features(load_prices())"
+```
+
+因子始终在全股票池计算，模型也使用同一完整股票池，保留行业排名等横截面因子的计算口径。
+
+## 主要文件和输出
+
+| 文件或目录 | 用途 |
+|---|---|
+| `price_source.py` | Parquet路径、主键与价格检查、源文件指纹 |
+| `data.py` | 在线下载并合并 `prices.parquet`，缓存位于 `data/download_cache/` |
+| `factors.py`、`extended_factors.py` | 计算417因子与标签，输出因子目录、字段用途和质量报告 |
+| `factor_selection.py` | 训练期质量筛选、稳定性评分、去冗余和PCA |
+| `main.py` | 核对完整行情/因子主键，使用全部股票按周期运行实验 |
+| `models.py` | 模型调参、测试评估、生产模型拟合、最新预测和组合评价 |
+| `experiment_store.py` | 实验标识、兼容周期合并、暂存发布、历史快照与失败保护 |
+| `backtest_metrics.py` | 当前及旧版回测共用的最大回撤计算，包含初始净值1 |
+| `report_data.py` | 网页与HTML共用的成功实验校验、字段与模型标签、策略筛选 |
+| `report_charts.py` | 共用的行情、模型、预测IC和组合净值图 |
+| `evaluate.py` | 原有因子IC与回测函数，当前 `main.py` 不直接调用 |
+| `app.py`、`export_html.py` | 展示或导出当前实验的实际模型、周期、预测、评价与组合策略 |
+| `saved_models/` | 当前训练代码保存的生产模型；`models/` 中是旧模型 |
+| `results/model_metrics.csv`、`test_predictions.csv` | 测试指标与逐条测试预测 |
+| `results/latest_predictions.csv`、`feature_importance.csv` | 生产模型最新预测与测试评估模型的重要性 |
+| `results/model_selection_trials.csv`、`tuning_trials.csv` | 参数和预处理候选的验证指标 |
+| `results/factor_selection.csv`、`preprocessing_summary.csv`、`pca_loadings.csv` | 各阶段筛选记录、预处理摘要和PCA载荷 |
+| `results/selected_features.csv` | 模型和周期使用的因子清单 |
+| `results/ic_daily.csv`、`ic_summary.csv`、`per_stock_metrics.csv` | 预测值的截面IC、Rank IC及逐股误差；区别于原始因子IC |
+| `results/backtest_nav.csv`、`backtest_summary.csv` | 新的5对5多空及前5名相对等权组合评价 |
+| `results/factor_group_ablation.csv` | 1日、5日周期的因子组消融实验 |
+| `results/metadata.json`、`run_metadata.json` | 输入指纹、股票名单、周期和运行记录 |
+| `experiment_history/` | 成功发布时保留的上一套完整结果和模型 |
+| `.experiment_staging/` | 本次训练的暂存输出与成功/失败状态；未成功输出不会作为当前结果 |
+
+原有 `factor_ic_daily.csv`、`factor_ic_summary.csv` 以及 `evaluate.py` 可生成的 `factor_time_ic_summary.csv`，不会由当前 `main.py` 自动更新，不能把目录中的旧文件当成新一轮实验结果。
+
+## 展示页面
+
+回测最大回撤统一按 `min(NAV / 历史最高净值 - 1)` 计算，历史高点包含建仓前的初始净值1。指标沿用非正数表示，例如初始1、首期跌至0.799、之后不变，最大回撤为-20.1%，不会报告为0。无有效净值观察时返回NaN，不冒充零回撤。
+
+当前组合评价和旧 `evaluate.py` 回测共用此公式，持仓、成本、累计收益和Sharpe的算法不变。已有历史CSV不自动改写；后续回测会生成修正指标，且公式代码已纳入实验版本标识，不能与旧公式结果混合。
+
+使用上级环境启动网页：
+
+```powershell
+& '..\.venv\Scripts\python.exe' -m streamlit run app.py
+```
+
+网页和HTML共用以下读取规则：只展示 `status=complete` 的实验，核对实验标识、行情/因子指纹、产物文件指纹和每条记录的实验编号。结果发布或产物变化时网页缓存失效；未登记的历史CSV不会作为回退数据。
+
+页面分为最新预测、模型评价、预测IC与逐股误差、组合回测、因子与预处理五部分。模型及周期由实际数据决定，支持当前各类模型，未知模型名也会原样显示；LSTM/Transformer只有测试评价时明确标注，不生成虚假的最新预测或零重要性解释。
+
+回测按模型、周期、策略、费用四项选择，读取当前的 `nav`、`cumulative_return` 等字段。多空5对5与前5名相对全池等权分别解释；10/20 bp按实际输出展示，费用为费率乘换手率，不再沿用旧“每期固定扣0.1%”说明。相对收益曲线不会伪装成实际基准资产净值。
+
+当前的 `ic_daily.csv`、`ic_summary.csv` 是模型预测IC/Rank IC，不是单因子IC。网页和HTML不会再读取旧 `factor_ic_*` 排行榜。没有生成的预测、重要性、回测或消融结果显示为空状态。
+
+导出当前成功实验的单文件HTML：
+
+```powershell
+& '..\.venv\Scripts\python.exe' export_html.py
+& '..\.venv\Scripts\python.exe' export_html.py --tables-only --output '当前实验_数据表.html'
+```
+
+默认新文件名为 `股票收益预测_当前实验报告.html`，保留已有历史 `股票收益预测项目_展示样板.html`。HTML包含本次所有模型和周期的数据表，可筛选、搜索、分页；图表可切换实际周期和组合，Plotly脚本内嵌，导出后无需联网加载绘图库。
+
+`--result-dir` 可以指定成功实验的结果目录；查看历史实验时可配合 `--price-file`、`--feature-file` 指定对应快照。读取校验失败不会覆盖已存在的报告。`--tables-only` 不加载绘图库或历史行情，仅导出完整可交互数据表。
+
+## 因子与计算口径
+
+保留原137个因子（100个量价因子、37个市场行业因子），新增280个，共417个。新增因子覆盖基本面、估值、成长、宏观、日历、全球市场、信息质量、行业排名与交互。
+
+- [新增280个因子的完整公式](新增因子完整公式.md)
+- [训练前因子筛选与降维说明](因子筛选与降维说明.md)
+
+417个候选因子先进行质量过滤、训练期IC/稳定性评分和高相关去冗余，再由验证集比较因子数量、PCA和模型参数。默认选择验证MAE最低的方案，保留质量过滤基准，不预设压缩一定改善精度。
+
+因子筛选评分保留训练期均衡采样，以控制评分与相关矩阵的内存开销；这个评分样本不限制预测模型的训练股票池或训练行数。IC的最低有效股票数和回测的5对5持仓数也不代表训练股票数量。
+
+收益标签为个股后续第h条交易观察的收盘价除以当前收盘价减1。按日期约70%/15%/15%切分，并使用隔离带及实际标签终点检查边界。测试集不参与调参；生产模型在测试评价结束后，另用全部成熟样本拟合。
+
+公共宏观、日历和海外数据按A股日期去重计算；新增因子保留缺失，不用未来值回填。因子含当日收盘信息，整体为收盘后预测。源表仍可能存在前复权回溯、财务重述、当前成分股和行业快照偏差，增加因子本身不能证明预测效果改善。
