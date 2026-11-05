@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>股票收益预测课程项目</title>
+<meta name="description" content="按股票、模型和预测周期查询已保存的收益预测，并查看模型表现、因子 IC 和策略回测。">
+<link rel="stylesheet" href="theme.css">
+<link rel="stylesheet" href="app.css">
+<script defer src="plotly.min.js"></script>
+<script defer src="app.js"></script>
+</head>
+<body>
+<main class="shell">
+<header class="top">
+  <div><h1>股票收益预测课程项目</h1><p class="sample" id="run-info"></p></div>
+  <nav class="tabs" aria-label="项目页面">
+    <button type="button" class="tab active" data-view="prediction" aria-controls="prediction" aria-pressed="true">首页预测</button>
+    <button type="button" class="tab" data-view="models" aria-controls="models" aria-pressed="false">模型表现</button>
+    <button type="button" class="tab" data-view="factors" aria-controls="factors" aria-pressed="false">因子表现</button>
+    <button type="button" class="tab" data-view="backtest" aria-controls="backtest" aria-pressed="false">策略回测</button>
+  </nav>
+</header>
+<p id="status" role="status">正在加载项目结果…</p>
+<p id="error" role="alert" hidden></p>
+<noscript><p>请开启 JavaScript 以查询预测和使用图表。</p></noscript>
+
+<section id="prediction" class="panel active" aria-labelledby="prediction-title">
+  <p class="kicker">01 / PREDICTION</p><h2 class="section-title" id="prediction-title">最新收益预测</h2>
+  <p class="desc">选择股票、预测周期与模型，查看该次训练保存的预测和参考目标价。</p>
+  <div class="glass controls">
+    <label>预测周期<select id="forecast-horizon"></select></label>
+    <label>模型<select id="forecast-model"></select></label>
+    <label class="wide">股票<select id="forecast-stock"></select></label>
+  </div>
+  <p id="forecast-date" class="note"></p>
+  <div class="grid4" id="forecast-cards"></div>
+  <div class="glass">
+    <h3 class="chart-title" id="price-title">历史 K 线与预测终点</h3>
+    <div id="price-chart" class="chart" aria-label="历史 K 线、成交量与预测终点"></div>
+    <p class="note">默认显示最近约 6 个月，图表支持悬停、拖动和缩放。金色虚线连接预测基准收盘价与参考目标价。终点日期按工作日估算。</p>
+  </div>
+  <div class="glass">
+    <h3 class="chart-title">股票池最新预测排名</h3>
+    <p class="note" id="ranking-info"></p>
+    <div class="table-scroll ranking" tabindex="0" role="region" aria-label="股票池最新预测排名"><table id="ranking" class="data-table"></table></div>
+  </div>
+</section>
+
+<section id="models" class="panel" aria-labelledby="models-title">
+  <p class="kicker">02 / MODELS</p><h2 class="section-title" id="models-title">模型表现比较</h2>
+  <p class="desc">读取原始测试集指标，各模型使用各自的有效样本。</p>
+  <div class="glass controls"><label>预测周期<select id="metric-horizon"></select></label></div>
+  <div class="glass">
+    <h3 class="chart-title">测试集 R² 与预测相关系数</h3><div id="model-chart" class="chart"></div>
+    <p class="note">R² 使用均值基线。超参数由验证集选择。</p>
+    <div class="table-scroll" tabindex="0" role="region" aria-label="模型测试指标"><table id="model-table" class="data-table"></table></div>
+  </div>
+  <div class="glass">
+    <h3 class="chart-title">模型因子权重 / 重要性</h3>
+    <div class="controls">
+      <label>模型<select id="importance-model"></select></label>
+      <label>因子类型<select id="importance-category"></select></label>
+      <label>显示数量<select id="importance-count"><option>10</option><option selected>20</option><option>30</option></select></label>
+    </div>
+    <p id="importance-method" class="note"></p>
+    <div id="importance-chart" class="chart"></div>
+    <details><summary>查看这些因子的类型与定义</summary><div class="table-scroll" tabindex="0" role="region" aria-label="模型因子定义"><table id="importance-table" class="data-table"></table></div></details>
+  </div>
+</section>
+
+<section id="factors" class="panel" aria-labelledby="factors-title">
+  <p class="kicker">03 / FACTORS</p><h2 class="section-title" id="factors-title">因子预测能力</h2>
+  <p class="desc">按所选区间的 |平均 IC| 排名，保留相关方向。</p>
+  <div class="glass controls">
+    <label>预测周期<select id="factor-horizon"></select></label>
+    <label>因子类型<select id="factor-category"></select></label>
+    <label>开始日期<input id="factor-start" type="date"></label>
+    <label>结束日期<input id="factor-end" type="date"></label>
+  </div>
+  <div class="glass">
+    <h3 class="chart-title">平均 IC 排名</h3>
+    <div id="factor-chart" class="chart"></div>
+    <p id="factor-info" class="note"></p>
+    <div class="table-scroll ranking" tabindex="0" role="region" aria-label="因子 IC 排名"><table id="factor-table" class="data-table"></table></div>
+    <details><summary>查看因子类型与定义</summary><div class="table-scroll ranking" tabindex="0" role="region" aria-label="因子类型与定义"><table id="factor-definitions" class="data-table"></table></div></details>
+  </div>
+</section>
+
+<section id="backtest" class="panel" aria-labelledby="backtest-title">
+  <p class="kicker">04 / BACKTEST</p><h2 class="section-title" id="backtest-title">样本外策略回测</h2>
+  <p class="desc">用测试集历史预测构建固定规则策略，并与股票池等权基准比较。</p>
+  <div class="glass controls">
+    <label>预测周期<select id="backtest-horizon"></select></label>
+    <label>模型<select id="backtest-model"></select></label>
+  </div>
+  <div class="grid4" id="backtest-cards"></div>
+  <div class="glass">
+    <h3 class="chart-title">策略与基准净值</h3>
+    <div id="backtest-chart" class="chart"></div>
+    <p class="note">按预测周期调仓，等权持有预测收益最高的 10 只股票，每次调仓扣 0.1% 成本。</p>
+  </div>
+</section>
+<footer class="footer">本站使用项目最后一次运行保存的数据。历史预测、因子 IC 与回测结果用于课程研究。</footer>
+</main>
+</body>
+</html>
